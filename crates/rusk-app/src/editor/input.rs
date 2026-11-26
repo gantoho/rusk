@@ -1906,7 +1906,35 @@ fn link_destination_at(doc: &mut Document, selection: Selection) -> Option<Range
     None
 }
 
-fn hit_test_local(doc: &Document, layout: &DocumentLayout, local: Pos2) -> usize {
+/// A click or vertical move that lands on the visual edge of formatted text
+/// should enter the editable span, not sit just outside the hidden marker.
+/// The marker bytes remain reachable by clicking the revealed syntax or by
+/// switching to Source mode.
+fn snap_into_inline_content(doc: &mut Document, pos: usize) -> usize {
+    let parsed = doc.parsed();
+    let mut start_target: Option<usize> = None;
+    let mut end_target: Option<usize> = None;
+    for block in &parsed.blocks {
+        if matches!(block.kind, BlockKind::CodeBlock(_) | BlockKind::Table) {
+            continue;
+        }
+        for marker in &block.markers {
+            if pos == marker.outer.start && marker.range.start == marker.outer.start {
+                start_target = Some(start_target.map_or(marker.range.end, |current: usize| {
+                    current.max(marker.range.end)
+                }));
+            }
+            if pos == marker.outer.end && marker.range.end == marker.outer.end {
+                end_target = Some(end_target.map_or(marker.range.start, |current: usize| {
+                    current.min(marker.range.start)
+                }));
+            }
+        }
+    }
+    start_target.or(end_target).unwrap_or(pos)
+}
+
+fn hit_test_local(doc: &mut Document, layout: &DocumentLayout, local: Pos2) -> usize {
     if layout.blocks.is_empty() {
         return 0;
     }
@@ -1953,7 +1981,10 @@ fn hit_test_local(doc: &Document, layout: &DocumentLayout, local: Pos2) -> usize
             if let Some(client) = &block.galley {
                 let local_text = local - block.text_pos.to_vec2();
                 let cursor = client.cursor_from_pos(local_text.to_vec2());
-                let source = block.projection.display_to_source(cursor.index.0);
+                let mut source = block.projection.display_to_source(cursor.index.0);
+                if layout.mode == rusk_core::ViewMode::Wysiwyg {
+                    source = snap_into_inline_content(doc, source);
+                }
                 return source.clamp(block.source_range.start, block.source_range.end);
             }
             if local.x >= block.text_pos.x {
@@ -2076,7 +2107,7 @@ mod tests {
             let mut layout = engine.build(&ctx, &mut doc, &theme, 600.0, 600.0, None);
             let first = layout.blocks.first().expect("first block");
             let target = Pos2::new(layout.content_left + 180.0, first.rect.top() + 10.0);
-            let head = hit_test_local(&doc, &layout, target);
+            let head = hit_test_local(&mut doc, &layout, target);
             doc.set_selection(Selection::caret(head));
             layout = engine.build(&ctx, &mut doc, &theme, 600.0, 600.0, None);
             let before = paint::caret_rect_local(&layout, &doc).expect("caret before");
@@ -2110,7 +2141,7 @@ mod tests {
             let mut layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
             let first = layout.blocks.first().expect("first block");
             let target = Pos2::new(layout.content_left + 400.0, first.rect.top() + 10.0);
-            let head = hit_test_local(&doc, &layout, target);
+            let head = hit_test_local(&mut doc, &layout, target);
             doc.set_selection(Selection::caret(head));
             layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
             let x0 = paint::caret_rect_local(&layout, &doc)
@@ -2350,6 +2381,13 @@ mod tests {
         move_horizontal(&mut doc, false, false, false);
         assert!(doc.insert_text("X", EditKind::Insert));
         assert_eq!(doc.text(), "A **Xbold** word");
+    }
+
+    #[test]
+    fn visual_edges_snap_into_inline_content() {
+        let mut doc = Document::from_text("A *italic* word");
+        assert_eq!(snap_into_inline_content(&mut doc, 2), 3);
+        assert_eq!(snap_into_inline_content(&mut doc, 10), 9);
     }
 
     #[test]
@@ -2876,7 +2914,7 @@ b
             .expect("table block");
         let point = egui::Pos2::new(layout.content_left + 20.0, table.rect.bottom() + 12.0);
         assert_eq!(
-            hit_test_local(&doc, &layout, point),
+            hit_test_local(&mut doc, &layout, point),
             30,
             "a click right under the table is not a click inside its last row"
         );
