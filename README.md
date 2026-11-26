@@ -3,6 +3,7 @@
 > 一个原生 Rust Markdown 编辑器。**Markdown 源码是唯一文档**，所见即所得只是源码的投影与装饰。
 
 [![GitHub](https://img.shields.io/badge/GitHub-gantoho%2Frusk-181717?logo=github)](https://github.com/gantoho/rusk)
+[![CI](https://github.com/gantoho/rusk/actions/workflows/ci.yml/badge.svg)](https://github.com/gantoho/rusk/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-b15832)](LICENSE)
 
 Rusk 不维护“富文本模型 → 导出 Markdown”的第二套文档，也没有 WebView。它用 `ropey` 保存原始字节，用 `pulldown-cmark` 为每个事件标注源码范围，再把语法标记“隐藏”成排版，把每一次输入写回同一份源码。
@@ -34,9 +35,11 @@ Rusk 采用第三条路线。它的核心不变式只有一条：
 - **表格**：非编辑态渲染为网格；点击单元格进入该表格的源码编辑，点击表格外恢复网格。
 - **图片**：本地相对路径/绝对路径图片直接渲染；加载失败时显示优雅占位符；点击图片进入源码编辑。
 - **大纲面板**：按标题层级生成，点击跳转。
+- **查找与替换**：`Ctrl+F` 打开查找条，`Ctrl+H` 展开替换；支持上一个/下一个、匹配计数、单次替换与全部替换。
 - **导出 HTML**：复用同一主题 token 生成独立 HTML；也可以复制 HTML 到剪贴板。
 - **撤销/重做**：事务式编辑，连续输入合并为一步。
 - **文件工作流**：打开、保存、另存为、拖放打开、未保存关闭确认。
+- **原生菜单**：Windows 下使用系统菜单栏（File / Edit / View），非 Windows 保留 egui 顶栏。
 - **双主题**：Paper（暖白）与 Ink（暖黑）。
 
 <table>
@@ -72,6 +75,8 @@ cargo build --release -p rusk-app
 | Write / Source 切换 | `Ctrl + /` |
 | 保存 / 另存为 | `Ctrl + S` / `Ctrl + Shift + S` |
 | 打开 / 新建 | `Ctrl + O` / `Ctrl + N` |
+| 查找 / 替换 | `Ctrl + F` / `Ctrl + H` |
+| 下一个 / 上一个匹配 | `Enter` / `Shift + Enter`（或 `F3` / `Shift + F3`） |
 | 导出 HTML | `Ctrl + Shift + E` |
 | 切换大纲 | `Ctrl + Shift + O` |
 | Paper / Ink 主题 | `Ctrl + Shift + D` |
@@ -164,6 +169,7 @@ cargo test -p rusk-app
 - CommonMark/GFM 块解析、嵌套列表、引用续行、围栏代码、表格。
 - 投影隐藏/揭示、链接目标隐藏、标题标记策略、脚注样式。
 - 列表续行前缀、Tab 缩进、标题标记保护、CJK 双击选词、CRLF 行尾。
+- 查找全部匹配、替换全部的单步撤销与选择落点。
 
 ## 已知限制 / 下一步
 
@@ -172,7 +178,8 @@ cargo test -p rusk-app
 3. **增量排版**：解析与投影已按 revision 缓存，但仍是整篇重排；超大文档（数 MB）需要可视区域虚拟化与增量解析。
 4. **数学公式**：行内/块级公式只做强调样式，不进行 LaTeX 排版。
 5. **PDF 导出**：HTML 导出已完成；PDF 可沿 HTML/CSS 管线继续做。
-6. **主题持久化 / 最近文件**：尚未写入配置目录。
+6. **查找选项**：当前为区分大小写的纯文本查找，暂未提供正则、整词或大小写切换。
+7. **主题持久化 / 最近文件**：尚未写入配置目录。
 
 ## 项目结构
 

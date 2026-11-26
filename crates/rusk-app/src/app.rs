@@ -7,7 +7,7 @@ use eframe::egui::{
     self, Align, Align2, Color32, Frame, Key, KeyboardShortcut, Layout, Margin, Modifiers,
     RichText, Sense, Stroke, Vec2,
 };
-use rusk_core::{Document, Selection, ViewMode};
+use rusk_core::{Document, EditKind, Selection, ViewMode};
 
 use crate::editor::Editor;
 use crate::theme::{Theme, ThemeKind, install_fonts};
@@ -35,6 +35,21 @@ struct Toast {
     error: bool,
 }
 
+#[derive(Default)]
+struct FindState {
+    open: bool,
+    replace_visible: bool,
+    query: String,
+    replacement: String,
+    focus_query: bool,
+}
+
+impl FindState {
+    fn height(&self) -> f32 {
+        if self.replace_visible { 78.0 } else { 44.0 }
+    }
+}
+
 pub struct RuskApp {
     doc: Document,
     editor: Editor,
@@ -47,6 +62,7 @@ pub struct RuskApp {
     close_now: bool,
     relayout_frames: u8,
     last_title: String,
+    find: FindState,
     #[cfg(target_os = "windows")]
     native_menu: Option<crate::native_menu::NativeMenu>,
 }
@@ -100,6 +116,7 @@ impl RuskApp {
             close_now: false,
             relayout_frames: 0,
             last_title,
+            find: FindState::default(),
             #[cfg(target_os = "windows")]
             native_menu,
         }
@@ -138,6 +155,21 @@ impl RuskApp {
                 MenuCmd::Shortcuts => self.modal = Modal::Shortcuts,
                 MenuCmd::About => self.modal = Modal::About,
                 MenuCmd::Quit => self.confirm(Pending::Close),
+                MenuCmd::Undo => {
+                    if self.doc.undo() {
+                        self.editor.invalidate_layout();
+                    }
+                    self.editor.request_focus();
+                }
+                MenuCmd::Redo => {
+                    if self.doc.redo() {
+                        self.editor.invalidate_layout();
+                    }
+                    self.editor.request_focus();
+                }
+                MenuCmd::Find => self.open_find(false),
+                MenuCmd::FindNext => self.find_step(false),
+                MenuCmd::Replace => self.open_find(true),
                 MenuCmd::WriteMode | MenuCmd::SourceMode => {
                     let mode = if cmd == MenuCmd::WriteMode {
                         ViewMode::Wysiwyg
@@ -194,8 +226,293 @@ impl RuskApp {
         });
     }
 
+    fn open_find(&mut self, replace: bool) {
+        if !self.find.open {
+            let selected = self.doc.selection_text();
+            if !selected.is_empty() && !selected.contains('\n') && selected.chars().count() <= 120 {
+                self.find.query = selected;
+            }
+        }
+        self.find.open = true;
+        self.find.replace_visible = replace;
+        self.find.focus_query = true;
+        self.find_select_first();
+    }
+
+    fn close_find(&mut self) {
+        self.find.open = false;
+        self.find.focus_query = false;
+        self.editor.request_focus();
+    }
+
+    fn find_matches(&self) -> Vec<std::ops::Range<usize>> {
+        self.doc.find_all(&self.find.query)
+    }
+
+    fn find_select_first(&mut self) {
+        let matches = self.find_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let selection = self.doc.selection();
+        if matches.iter().any(|range| range == &selection.range()) {
+            return;
+        }
+        let target = matches
+            .iter()
+            .find(|range| range.start >= selection.end())
+            .or_else(|| matches.first())
+            .cloned();
+        if let Some(range) = target {
+            self.doc
+                .set_selection(Selection::new(range.start, range.end));
+            self.editor.scroll_to_caret = true;
+        }
+    }
+
+    fn find_step(&mut self, backward: bool) {
+        let matches = self.find_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let selection = self.doc.selection().range();
+        let current = matches.iter().position(|range| range == &selection);
+        let index = match current {
+            Some(index) => {
+                if backward {
+                    (index + matches.len() - 1) % matches.len()
+                } else {
+                    (index + 1) % matches.len()
+                }
+            }
+            None => {
+                if backward {
+                    matches
+                        .iter()
+                        .rposition(|range| range.end <= selection.start)
+                        .unwrap_or(matches.len() - 1)
+                } else {
+                    matches
+                        .iter()
+                        .position(|range| range.start >= selection.end)
+                        .unwrap_or(0)
+                }
+            }
+        };
+        let range = matches[index].clone();
+        self.doc
+            .set_selection(Selection::new(range.start, range.end));
+        self.editor.scroll_to_caret = true;
+    }
+
+    fn replace_current(&mut self) {
+        if self.find.query.is_empty() {
+            return;
+        }
+        let selection = self.doc.selection().range();
+        let is_match = self.find_matches().iter().any(|range| range == &selection);
+        if !is_match {
+            self.find_step(false);
+            return;
+        }
+        let replacement = self.find.replacement.clone();
+        if self
+            .doc
+            .replace_range(selection, &replacement, EditKind::Replace)
+        {
+            self.find_step(false);
+        }
+    }
+
+    fn replace_all_matches(&mut self) {
+        if self.find.query.is_empty() {
+            return;
+        }
+        let count = self
+            .doc
+            .replace_all(&self.find.query, &self.find.replacement);
+        if count == 0 {
+            self.set_toast("No matches", false);
+        } else {
+            self.set_toast(format!("Replaced {count} matches"), false);
+            self.editor.scroll_to_caret = true;
+        }
+    }
+
+    fn find_bar(&mut self, ui: &mut egui::Ui) {
+        let theme = self.theme;
+        let query_id = ui.make_persistent_id("rusk-find-query");
+        let query_focused = ui.memory(|memory| memory.has_focus(query_id));
+        let mut close = false;
+        let mut next = false;
+        let mut previous = false;
+        let mut replace_one = false;
+        let mut replace_all = false;
+        let mut toggle_replace = false;
+
+        if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            close = true;
+        } else if query_focused {
+            if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+                next = true;
+            } else if ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Enter)) {
+                previous = true;
+            }
+        }
+
+        let mut query = self.find.query.clone();
+        let mut replacement = self.find.replacement.clone();
+        let matches = self.doc.find_all(&query);
+        let selection = self.doc.selection().range();
+        let current = matches
+            .iter()
+            .position(|range| range == &selection)
+            .map_or(0, |index| index + 1);
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(RichText::new("Find").size(12.0).color(theme.muted));
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut query)
+                    .id(query_id)
+                    .hint_text("Search in document")
+                    .desired_width(260.0),
+            );
+            if self.find.focus_query {
+                response.request_focus();
+                self.find.focus_query = false;
+            }
+            if response.changed() {
+                self.find.query = query.clone();
+                self.find_select_first();
+            }
+            let count = if matches.is_empty() {
+                "0/0".to_owned()
+            } else {
+                format!("{current}/{}", matches.len())
+            };
+            ui.label(
+                RichText::new(count)
+                    .font(theme.mono_font(10.5))
+                    .color(theme.faint),
+            );
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("↑").size(14.0).color(theme.muted))
+                        .frame(false),
+                )
+                .on_hover_text("Previous match (Shift+Enter)")
+                .clicked()
+            {
+                previous = true;
+            }
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("↓").size(14.0).color(theme.muted))
+                        .frame(false),
+                )
+                .on_hover_text("Next match (Enter)")
+                .clicked()
+            {
+                next = true;
+            }
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Replace").size(11.5).color(
+                        if self.find.replace_visible {
+                            theme.accent
+                        } else {
+                            theme.muted
+                        },
+                    ))
+                    .frame(false),
+                )
+                .clicked()
+            {
+                toggle_replace = true;
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("×").size(16.0).color(theme.muted))
+                            .frame(false),
+                    )
+                    .on_hover_text("Close (Esc)")
+                    .clicked()
+                {
+                    close = true;
+                }
+            });
+        });
+
+        if self.find.replace_visible {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.add_space(30.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut replacement)
+                        .hint_text("Replace with")
+                        .desired_width(260.0),
+                );
+                if ui.button("Replace").clicked() {
+                    replace_one = true;
+                }
+                if ui.button("All").clicked() {
+                    replace_all = true;
+                }
+            });
+        }
+
+        if query != self.find.query {
+            self.find.query = query;
+        }
+        if replacement != self.find.replacement {
+            self.find.replacement = replacement;
+        }
+        if toggle_replace {
+            self.find.replace_visible = !self.find.replace_visible;
+            self.find.focus_query = true;
+        }
+        if close {
+            self.close_find();
+            return;
+        }
+        if previous {
+            self.find_step(true);
+        } else if next {
+            self.find_step(false);
+        }
+        if replace_one {
+            self.replace_current();
+        }
+        if replace_all {
+            self.replace_all_matches();
+        }
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if !matches!(self.modal, Modal::None) {
+            return;
+        }
+        if self.find.open && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.close_find();
+            return;
+        }
+        if consume(ctx, Modifiers::COMMAND, Key::F) {
+            self.open_find(false);
+            return;
+        }
+        if consume(ctx, Modifiers::COMMAND, Key::H) {
+            self.open_find(true);
+            return;
+        }
+        if consume(ctx, Modifiers::NONE, Key::F3) {
+            self.find_step(false);
+            return;
+        }
+        if consume(ctx, Modifiers::SHIFT, Key::F3) {
+            self.find_step(true);
             return;
         }
         if consume(ctx, Modifiers::COMMAND | Modifiers::SHIFT, Key::S) {
@@ -243,6 +560,7 @@ impl RuskApp {
         match pending {
             Pending::New => {
                 self.doc = Document::empty();
+                self.close_find();
                 self.editor.reset(true);
                 self.editor.request_focus();
                 self.set_toast("New document", false);
@@ -272,6 +590,7 @@ impl RuskApp {
         match Document::open(path) {
             Ok(doc) => {
                 self.doc = doc;
+                self.close_find();
                 self.editor.reset(true);
                 self.editor.request_focus();
                 self.set_toast(format!("Opened {}", path.display()), false);
@@ -910,6 +1229,18 @@ impl eframe::App for RuskApp {
                         .inner_margin(Margin::symmetric(18, 0)),
                 )
                 .show(ui, |ui| self.top_bar(ui, &ctx));
+        }
+
+        if self.find.open {
+            egui::Panel::top("rusk-find")
+                .exact_size(self.find.height())
+                .frame(
+                    Frame::new()
+                        .fill(theme.panel)
+                        .stroke(Stroke::new(1.0, theme.border))
+                        .inner_margin(Margin::symmetric(18, 5)),
+                )
+                .show(ui, |ui| self.find_bar(ui));
         }
 
         let body = ui.available_rect_before_wrap();

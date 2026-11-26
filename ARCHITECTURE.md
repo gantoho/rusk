@@ -186,6 +186,14 @@ Segment {
 - Ctrl+单击：打开链接（`open` crate）。
 - 文件拖放：打开文件（有未保存修改时先确认）。
 
+### 查找与替换
+
+- `Document::find_all` 返回文档顺序的非重叠字节范围，供匹配计数与逐项定位使用。
+- 查找条只保存 query/replacement 与 UI 状态；当前匹配直接写入 `Selection`，因此复用现有的选区高亮、滚动与光标映射。
+- `Enter` / `Shift+Enter` 循环到下一个/上一个匹配，`F3` 同样可用。
+- 单次替换复用 `Document::replace_range`；全部替换由 `Document::replace_all` 构造一个包含多个非重叠 `Edit` 的事务，因此整个批量替换是一步撤销。
+- Windows 原生菜单的 Edit 子菜单也映射到同一组命令；非 Windows 使用 `Ctrl+F` / `Ctrl+H` 快捷键。
+
 ### IME
 
 - 组合输入使用 `ime_preedit` 临时字符串，不写入文档。

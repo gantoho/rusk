@@ -22,6 +22,11 @@ pub enum MenuCmd {
     Shortcuts,
     About,
     Quit,
+    Undo,
+    Redo,
+    Find,
+    FindNext,
+    Replace,
     WriteMode,
     SourceMode,
     ToggleOutline,
@@ -40,6 +45,11 @@ impl MenuCmd {
             "shortcuts" => Self::Shortcuts,
             "about" => Self::About,
             "quit" => Self::Quit,
+            "undo" => Self::Undo,
+            "redo" => Self::Redo,
+            "find" => Self::Find,
+            "find-next" => Self::FindNext,
+            "replace" => Self::Replace,
             "write-mode" => Self::WriteMode,
             "source-mode" => Self::SourceMode,
             "outline" => Self::ToggleOutline,
@@ -149,6 +159,25 @@ fn build_menu() -> Option<(Menu, ViewItems)> {
         accel(ctrl_shift, Code::KeyD),
     );
 
+    let edit = Submenu::with_items(
+        "Edit",
+        true,
+        &[
+            &MenuItem::with_id("undo", "Undo", true, accel(ctrl, Code::KeyZ)),
+            &MenuItem::with_id("redo", "Redo", true, accel(ctrl, Code::KeyY)),
+            &PredefinedMenuItem::separator(),
+            &MenuItem::with_id("find", "Find…", true, accel(ctrl, Code::KeyF)),
+            &MenuItem::with_id(
+                "find-next",
+                "Find Next",
+                true,
+                accel(Modifiers::empty(), Code::F3),
+            ),
+            &MenuItem::with_id("replace", "Replace…", true, accel(ctrl, Code::KeyH)),
+        ],
+    )
+    .ok()?;
+
     let view = Submenu::with_items(
         "View",
         true,
@@ -196,6 +225,7 @@ fn build_menu() -> Option<(Menu, ViewItems)> {
 
     let menu = Menu::new();
     menu.append(&file).ok()?;
+    menu.append(&edit).ok()?;
     menu.append(&view).ok()?;
     Some((
         menu,

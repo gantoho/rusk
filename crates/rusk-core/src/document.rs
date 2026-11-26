@@ -472,6 +472,50 @@ impl Document {
         text.find(needle).map(|at| at..at + needle.len())
     }
 
+    /// All non-overlapping occurrences of `needle`, in document order.
+    #[must_use]
+    pub fn find_all(&self, needle: &str) -> Vec<std::ops::Range<usize>> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let text = self.buffer.as_str();
+        let mut matches = Vec::new();
+        let mut cursor = 0usize;
+        while cursor <= text.len() {
+            let Some(offset) = text[cursor..].find(needle) else {
+                break;
+            };
+            let start = cursor + offset;
+            let end = start + needle.len();
+            matches.push(start..end);
+            cursor = end.max(start + 1);
+        }
+        matches
+    }
+
+    /// Replace every occurrence of `needle` in one undoable transaction.
+    /// Returns the number of replacements.
+    pub fn replace_all(&mut self, needle: &str, replacement: &str) -> usize {
+        let matches = self.find_all(needle);
+        let Some(last) = matches.last() else {
+            return 0;
+        };
+        let delta = replacement.len() as isize - needle.len() as isize;
+        let final_start =
+            (last.start as isize + delta * (matches.len() - 1) as isize).max(0) as usize;
+        let selection_after = Selection::caret(final_start + replacement.len());
+        let edits: Vec<Edit> = matches
+            .into_iter()
+            .map(|range| Edit::replace(range, replacement.to_owned()))
+            .collect();
+        let count = edits.len();
+        if self.apply_transaction(Transaction::new(edits, selection_after, EditKind::Replace)) {
+            count
+        } else {
+            0
+        }
+    }
+
     #[must_use]
     pub fn block_index_at_selection(&mut self) -> Option<usize> {
         let head = self.selection.head;
@@ -577,5 +621,23 @@ mod tests {
     fn initial_caret_is_inside_the_first_block_not_the_marker() {
         let doc = Document::from_text("# Title");
         assert_eq!(doc.selection().head, 2);
+    }
+
+    #[test]
+    fn find_all_is_non_overlapping() {
+        let doc = Document::from_text("aaaa aa");
+        let matches = doc.find_all("aa");
+        assert_eq!(matches.len(), 3);
+        assert_eq!(&"aaaa aa"[matches[0].clone()], "aa");
+    }
+
+    #[test]
+    fn replace_all_is_one_undoable_transaction() {
+        let mut doc = Document::from_text("one fish two fish");
+        assert_eq!(doc.replace_all("fish", "cat"), 2);
+        assert_eq!(doc.text(), "one cat two cat");
+        assert_eq!(doc.selection().head, 15);
+        assert!(doc.undo());
+        assert_eq!(doc.text(), "one fish two fish");
     }
 }
