@@ -23,6 +23,7 @@ pub struct Editor {
     last_caret_activity: f64,
     ime_preedit: String,
     pub last_ime_rect: Option<Rect>,
+    vertical_goal_x: Option<f32>,
 }
 
 #[derive(Default)]
@@ -46,6 +47,7 @@ impl Editor {
             last_caret_activity: 0.0,
             ime_preedit: String::new(),
             last_ime_rect: None,
+            vertical_goal_x: None,
         }
     }
 
@@ -55,14 +57,20 @@ impl Editor {
         self.drag_anchor = None;
         self.ime_preedit.clear();
         self.focus_requested = true;
+        self.vertical_goal_x = None;
     }
 
     pub fn request_focus(&mut self) {
         self.focus_requested = true;
     }
 
+    pub fn reset_vertical_goal(&mut self) {
+        self.vertical_goal_x = None;
+    }
+
     pub fn invalidate_layout(&mut self) {
         self.layout = None;
+        self.vertical_goal_x = None;
     }
 
     pub fn focus_id(&self) -> Id {

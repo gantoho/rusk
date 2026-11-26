@@ -6,7 +6,7 @@
 use std::ops::Range;
 
 use eframe::egui::{self, Event, ImeEvent, Key, PointerButton, Pos2, Response, Ui};
-use rusk_core::markdown::{BlockKind, PrefixKind};
+use rusk_core::markdown::{BlockKind, MarkerKind, PrefixKind};
 use rusk_core::{Document, Edit, EditKind, Selection, Transaction};
 
 use super::layout::{DocumentLayout, LaidBlock, LaidKind};
@@ -39,6 +39,9 @@ impl super::Editor {
         let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
         let primary_released = ui.input(|i| i.pointer.primary_released());
         let primary_down = ui.input(|i| i.pointer.primary_down());
+        if primary_pressed {
+            self.vertical_goal_x = None;
+        }
 
         if primary_pressed && response.hovered() {
             ui.memory_mut(|memory| memory.request_focus(self.focus_id()));
@@ -116,6 +119,17 @@ impl super::Editor {
         let time = ui.input(|i| i.time);
 
         for event in events {
+            let vertical = matches!(
+                &event,
+                Event::Key {
+                    key: Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown,
+                    pressed: true,
+                    ..
+                }
+            );
+            if !vertical {
+                self.vertical_goal_x = None;
+            }
             match event {
                 Event::Text(text) if !text.is_empty() => {
                     let interactive_text =
@@ -147,7 +161,7 @@ impl super::Editor {
                 Event::Cut => {
                     if !doc.selection().is_caret() {
                         ui.ctx().copy_text(doc.selection_text());
-                        if doc.delete_selection(EditKind::Delete) {
+                        if delete_selection_guarded(doc) {
                             changed = true;
                             scroll = true;
                         }
@@ -279,21 +293,49 @@ impl super::Editor {
                             scroll = true;
                         }
                         Key::ArrowUp => {
-                            move_vertical(ui, layout, doc, -1.0, modifiers.shift);
+                            move_vertical(
+                                ui,
+                                layout,
+                                doc,
+                                -1.0,
+                                modifiers.shift,
+                                &mut self.vertical_goal_x,
+                            );
                             scroll = true;
                         }
                         Key::ArrowDown => {
-                            move_vertical(ui, layout, doc, 1.0, modifiers.shift);
+                            move_vertical(
+                                ui,
+                                layout,
+                                doc,
+                                1.0,
+                                modifiers.shift,
+                                &mut self.vertical_goal_x,
+                            );
                             scroll = true;
                         }
                         Key::PageUp => {
                             let step = ui.clip_rect().height().max(120.0) * 0.9;
-                            move_vertical_by(ui, layout, doc, -step, modifiers.shift);
+                            move_vertical_by(
+                                ui,
+                                layout,
+                                doc,
+                                -step,
+                                modifiers.shift,
+                                &mut self.vertical_goal_x,
+                            );
                             scroll = true;
                         }
                         Key::PageDown => {
                             let step = ui.clip_rect().height().max(120.0) * 0.9;
-                            move_vertical_by(ui, layout, doc, step, modifiers.shift);
+                            move_vertical_by(
+                                ui,
+                                layout,
+                                doc,
+                                step,
+                                modifiers.shift,
+                                &mut self.vertical_goal_x,
+                            );
                             scroll = true;
                         }
                         Key::Home => {
@@ -598,9 +640,202 @@ fn fence_run(line: &str) -> Option<(usize, char, usize)> {
     Some((indent, fence, count))
 }
 
+fn remove_block_prefix_at(doc: &mut Document, head: usize) -> bool {
+    let text = doc.text();
+    let ranges = {
+        let parsed = doc.parsed();
+        let Some(block) = parsed.blocks.iter().find(|block| {
+            block.range.start <= head
+                && head <= block.range.end
+                && (block.content.start == head
+                    || block.prefix.iter().any(|prefix| prefix.range.end == head))
+        }) else {
+            return false;
+        };
+        let has_list = block.list_marker.is_some()
+            || block
+                .prefix
+                .iter()
+                .any(|prefix| matches!(prefix.kind, PrefixKind::ListMarker | PrefixKind::Task));
+        if has_list {
+            return false;
+        }
+        let mut ranges: Vec<Range<usize>> = block
+            .prefix
+            .iter()
+            .filter(|prefix| matches!(prefix.kind, PrefixKind::Heading | PrefixKind::Quote))
+            .map(|prefix| prefix.range.clone())
+            .collect();
+        if head == block.content.start
+            && (block.quote_depth > 0
+                || block
+                    .prefix
+                    .iter()
+                    .any(|prefix| prefix.kind == PrefixKind::Heading))
+        {
+            let line_start = text[..head].rfind('\n').map_or(0, |offset| offset + 1);
+            ranges.push(line_start..head);
+        }
+        if block.quote_depth > 0 {
+            ranges.extend(quote_prefixes(&text, block.range.start, block.range.end));
+        }
+        ranges.sort_unstable_by_key(|range| (range.start, range.end));
+        ranges.dedup();
+        ranges
+    };
+    if ranges.is_empty() {
+        return false;
+    }
+    remove_marker_ranges(doc, ranges, Selection::caret(head))
+}
+
+/// Leading `>` markers on every line the blockquote occupies. The parser keeps
+/// those bytes outside `block.range`, so they need a small source scan.
+fn quote_prefixes(text: &str, start: usize, end: usize) -> Vec<Range<usize>> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut line_start = text[..start.min(text.len())]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let last = end.saturating_sub(1).min(text.len().saturating_sub(1));
+    while line_start <= last {
+        let line_end = text[line_start..]
+            .find('\n')
+            .map_or(text.len(), |offset| line_start + offset);
+        let line = &text[line_start..line_end];
+        let mut index = line.len() - line.trim_start_matches(' ').len();
+        if index > 3 {
+            index = 0;
+        }
+        let original = index;
+        while line.as_bytes().get(index) == Some(&b'>') {
+            index += 1;
+            if line.as_bytes().get(index) == Some(&b' ') {
+                index += 1;
+            }
+        }
+        if index > original {
+            ranges.push(line_start..line_start + index);
+        }
+        if line_end >= text.len() {
+            break;
+        }
+        line_start = line_end + 1;
+    }
+    ranges
+}
+
+fn remove_inline_formatting_at(doc: &mut Document, head: usize, backspace: bool) -> bool {
+    let target = {
+        let parsed = doc.parsed();
+        let mut found = None;
+        'blocks: for block in &parsed.blocks {
+            if block.content.start > head || head > block.content.end {
+                continue;
+            }
+            for marker in &block.markers {
+                if !matches!(
+                    marker.kind,
+                    MarkerKind::Strong
+                        | MarkerKind::Emphasis
+                        | MarkerKind::Strikethrough
+                        | MarkerKind::Code
+                        | MarkerKind::Link
+                        | MarkerKind::Math
+                ) {
+                    continue;
+                }
+                let boundary = if backspace {
+                    marker.range.start == marker.outer.start && head == marker.range.end
+                } else {
+                    marker.range.end == marker.outer.end && head == marker.range.start
+                };
+                if boundary {
+                    found = Some((marker.outer.clone(), marker.kind));
+                    break 'blocks;
+                }
+            }
+        }
+        found
+    };
+    let Some((outer, kind)) = target else {
+        return false;
+    };
+    let mut ranges: Vec<Range<usize>> = doc
+        .parsed()
+        .blocks
+        .iter()
+        .flat_map(|block| &block.markers)
+        .filter(|marker| marker.kind == kind && marker.outer == outer)
+        .map(|marker| marker.range.clone())
+        .collect();
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    ranges.dedup();
+    if ranges.len() < 2 {
+        return false;
+    }
+    remove_marker_ranges(doc, ranges, Selection::caret(head))
+}
+
+fn delete_selection_guarded(doc: &mut Document) -> bool {
+    let selection = doc.selection();
+    if selection.is_caret() {
+        return false;
+    }
+    if let Some(outer) = formatting_outer_for_inner(doc, &selection.range()) {
+        let head = outer.start;
+        return doc.apply_transaction(Transaction::new(
+            vec![Edit::delete(outer)],
+            Selection::caret(head),
+            EditKind::Delete,
+        ));
+    }
+    doc.delete_selection(EditKind::Delete)
+}
+
+/// If the selection is exactly the visible text between a marker pair, remove
+/// the whole construct. Deleting only the text would leave empty `****`,
+/// `[](url)` or ``` `` ``` behind.
+fn formatting_outer_for_inner(doc: &mut Document, range: &Range<usize>) -> Option<Range<usize>> {
+    let mut best: Option<Range<usize>> = None;
+    for block in &doc.parsed().blocks {
+        let mut outers: Vec<Range<usize>> = block
+            .markers
+            .iter()
+            .filter(|marker| marker.kind != MarkerKind::Image)
+            .map(|marker| marker.outer.clone())
+            .collect();
+        outers.sort_unstable_by_key(|outer| (outer.start, outer.end));
+        outers.dedup();
+        for outer in outers {
+            let open = block.markers.iter().find(|marker| {
+                marker.kind != MarkerKind::Image
+                    && marker.outer == outer
+                    && marker.range.start == outer.start
+            });
+            let close = block.markers.iter().find(|marker| {
+                marker.kind != MarkerKind::Image
+                    && marker.outer == outer
+                    && marker.range.end == outer.end
+            });
+            let (Some(open), Some(close)) = (open, close) else {
+                continue;
+            };
+            if *range == (open.range.end..close.range.start)
+                && best.as_ref().is_none_or(|best| best.len() > outer.len())
+            {
+                best = Some(outer);
+            }
+        }
+    }
+    best
+}
+
 fn backspace_guarded(doc: &mut Document) -> bool {
     if !doc.selection().is_caret() {
-        return doc.backspace();
+        return delete_selection_guarded(doc);
     }
     let head = doc.selection().head;
     if doc.mode() == rusk_core::ViewMode::Wysiwyg && collapse_fence(doc) {
@@ -608,6 +843,12 @@ fn backspace_guarded(doc: &mut Document) -> bool {
     }
     if doc.mode() == rusk_core::ViewMode::Wysiwyg && in_raw_code(doc, head) {
         return doc.backspace();
+    }
+    if doc.mode() == rusk_core::ViewMode::Wysiwyg && remove_block_prefix_at(doc, head) {
+        return true;
+    }
+    if doc.mode() == rusk_core::ViewMode::Wysiwyg && remove_inline_formatting_at(doc, head, true) {
+        return true;
     }
     if doc.mode() == rusk_core::ViewMode::Wysiwyg
         && let Some((start, end)) = line_break_ending_at(&doc.buffer().as_str(), head)
@@ -650,11 +891,14 @@ fn backspace_guarded(doc: &mut Document) -> bool {
 
 fn delete_guarded(doc: &mut Document) -> bool {
     if !doc.selection().is_caret() {
-        return doc.delete_forward();
+        return delete_selection_guarded(doc);
     }
     let head = doc.selection().head;
     if doc.mode() == rusk_core::ViewMode::Wysiwyg && in_raw_code(doc, head) {
         return doc.delete_forward();
+    }
+    if doc.mode() == rusk_core::ViewMode::Wysiwyg && remove_inline_formatting_at(doc, head, false) {
+        return true;
     }
     if doc.mode() == rusk_core::ViewMode::Wysiwyg
         && let Some((start, end)) = line_break_starting_at(&doc.buffer().as_str(), head)
@@ -743,7 +987,7 @@ fn word_boundary(doc: &Document, at: usize, left: bool) -> usize {
 
 fn delete_word(doc: &mut Document, left: bool) -> bool {
     if !doc.selection().is_caret() {
-        return doc.delete_selection(EditKind::Delete);
+        return delete_selection_guarded(doc);
     }
     let head = doc.selection().head;
     let target = word_boundary(doc, head, left);
@@ -764,16 +1008,13 @@ fn move_vertical(
     doc: &mut Document,
     direction: f32,
     extend: bool,
+    goal_x: &mut Option<f32>,
 ) {
     let Some(caret) = paint::caret_rect_local(layout, doc) else {
         return;
     };
-    let delta = if direction < 0.0 {
-        -caret.height().max(20.0) * 1.15
-    } else {
-        caret.height().max(20.0) * 1.15
-    };
-    move_vertical_by(ui, layout, doc, delta, extend);
+    let delta = caret.height().max(20.0) * 1.15 * direction;
+    move_vertical_by(ui, layout, doc, delta, extend, goal_x);
 }
 
 fn move_vertical_by(
@@ -782,14 +1023,15 @@ fn move_vertical_by(
     doc: &mut Document,
     delta: f32,
     extend: bool,
+    goal_x: &mut Option<f32>,
 ) {
     let Some(caret) = paint::caret_rect_local(layout, doc) else {
         return;
     };
-    let target = Pos2::new(
-        caret.left().max(layout.content_left),
-        caret.center().y + delta,
-    );
+    let x = goal_x
+        .get_or_insert_with(|| caret.left().max(layout.content_left))
+        .max(layout.content_left);
+    let target = Pos2::new(x, caret.center().y + delta);
     if target.y < TOP_MARGIN {
         let pos = if delta < 0.0 { 0 } else { doc.len_bytes() };
         doc.set_selection(select_to(doc, pos, extend));
@@ -1132,7 +1374,7 @@ fn deleting_break_merges_blocks(doc: &mut Document, start: usize, end: usize) ->
 
 fn handle_enter(doc: &mut Document, layout: &DocumentLayout) -> bool {
     if !doc.selection().is_caret() {
-        doc.delete_selection(EditKind::Delete);
+        delete_selection_guarded(doc);
     }
     let caret = doc.selection().head;
     let line = doc.buffer().line_of_byte(caret);
@@ -1382,25 +1624,36 @@ fn handle_tab(doc: &mut Document, outdent: bool) -> bool {
 
 fn toggle_wrap(ui: &mut Ui, doc: &mut Document, marker: &str) -> bool {
     let _ = ui;
+    let Some(kind) = marker_kind(marker) else {
+        return false;
+    };
     let selection = doc.selection();
-    let range = selection.range();
-    let source = doc.buffer().as_str();
-    let selected = source[range.clone()].to_owned();
-    let before_has = source[..range.start].ends_with(marker);
-    let after_has = source[range.end..].starts_with(marker);
-
-    if before_has && after_has {
-        let start = range.start - marker.len();
-        let end = range.end + marker.len();
-        return doc.apply_transaction(Transaction::new(
-            vec![Edit::replace(start..end, selected.clone())],
-            Selection::new(start, start + selected.len()),
-            EditKind::Format,
-        ));
+    if doc.mode() == rusk_core::ViewMode::Wysiwyg && in_raw_code(doc, selection.head) {
+        return false;
     }
 
+    let ranges = if doc.mode() == rusk_core::ViewMode::Wysiwyg {
+        formatting_ranges(doc, kind, selection)
+    } else {
+        Vec::new()
+    };
+    if !ranges.is_empty() {
+        return remove_marker_ranges(doc, ranges, selection);
+    }
+
+    let range = selection.range();
     if selection.is_caret() {
         let at = selection.head;
+        let word = word_range_at(doc, at);
+        let word_text = doc.buffer().as_str()[word.clone()].to_owned();
+        if word_text.chars().any(is_word_char) {
+            let replacement = format!("{marker}{word_text}{marker}");
+            return doc.apply_transaction(Transaction::new(
+                vec![Edit::replace(word, replacement)],
+                Selection::caret(at + marker.len()),
+                EditKind::Format,
+            ));
+        }
         let text = format!("{marker}{marker}");
         let caret = at + marker.len();
         return doc.apply_transaction(Transaction::new(
@@ -1410,6 +1663,16 @@ fn toggle_wrap(ui: &mut Ui, doc: &mut Document, marker: &str) -> bool {
         ));
     }
 
+    // A marker pair cannot span paragraphs or list items. Refusing is better
+    // than writing Markdown that renders as unbalanced text.
+    if !selection_fits_one_block(doc, &range) {
+        return false;
+    }
+    if doc.buffer().as_str()[range.clone()].trim().is_empty() {
+        return false;
+    }
+
+    let selected = doc.buffer().as_str()[range.clone()].to_owned();
     let replacement = format!("{marker}{selected}{marker}");
     let selection_after = Selection::new(
         range.start + marker.len(),
@@ -1422,23 +1685,167 @@ fn toggle_wrap(ui: &mut Ui, doc: &mut Document, marker: &str) -> bool {
     ))
 }
 
+fn marker_kind(marker: &str) -> Option<MarkerKind> {
+    match marker {
+        "**" => Some(MarkerKind::Strong),
+        "*" => Some(MarkerKind::Emphasis),
+        "`" => Some(MarkerKind::Code),
+        "~~" => Some(MarkerKind::Strikethrough),
+        _ => None,
+    }
+}
+
+/// Delimiters of an existing construct of `kind` that the selection touches.
+/// Both halves are returned, so formatting is removed rather than adding a
+/// second pair around text that is already formatted.
+fn formatting_ranges(
+    doc: &mut Document,
+    kind: MarkerKind,
+    selection: Selection,
+) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    for block in &doc.parsed().blocks {
+        for marker in &block.markers {
+            if marker.kind != kind {
+                continue;
+            }
+            let touched = if selection.is_caret() {
+                marker.outer.start <= selection.head && selection.head <= marker.outer.end
+            } else {
+                marker.outer.start <= selection.start() && selection.end() <= marker.outer.end
+            };
+            if touched {
+                ranges.push(marker.range.clone());
+            }
+        }
+    }
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    ranges.dedup();
+    ranges
+}
+
+fn selection_fits_one_block(doc: &mut Document, range: &Range<usize>) -> bool {
+    if doc.len_bytes() == 0 {
+        return true;
+    }
+    doc.parsed()
+        .blocks
+        .iter()
+        .any(|block| block.content.start <= range.start && range.end <= block.content.end)
+}
+
+/// Remove complete marker pairs. The caret/selection is shifted by the bytes
+/// actually removed before it, so deleting the opening delimiter does not drag
+/// the caret into the following text.
+fn remove_marker_ranges(
+    doc: &mut Document,
+    ranges: Vec<Range<usize>>,
+    selection: Selection,
+) -> bool {
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    if merged.is_empty() {
+        return false;
+    }
+
+    let shift = |pos: usize| -> usize {
+        let mut removed = 0;
+        for range in &merged {
+            if range.end <= pos {
+                removed += range.end - range.start;
+            } else if range.start < pos {
+                removed += pos - range.start;
+            }
+        }
+        pos.saturating_sub(removed)
+    };
+    let selection_after = Selection::new(shift(selection.anchor), shift(selection.head));
+    let edits: Vec<Edit> = merged.into_iter().map(Edit::delete).collect();
+    doc.apply_transaction(Transaction::new(edits, selection_after, EditKind::Format))
+}
+
 fn insert_link(doc: &mut Document) -> bool {
+    if doc.mode() == rusk_core::ViewMode::Wysiwyg && in_raw_code(doc, doc.selection().head) {
+        return false;
+    }
     let selection = doc.selection();
-    let source = doc.buffer().as_str();
-    let selected = &source[selection.range()];
+    if let Some(url) = link_destination_at(doc, selection) {
+        doc.set_selection(Selection::new(url.start, url.end));
+        return true;
+    }
+    let mut range = selection.range();
+    let mut selected = doc.buffer().as_str()[range.clone()].to_owned();
+    if selection.is_caret() {
+        let word = word_range_at(doc, selection.head);
+        let word_text = doc.buffer().as_str()[word.clone()].to_owned();
+        if word_text.chars().any(is_word_char) {
+            range = word;
+            selected = word_text;
+        }
+    }
+    if !selection.is_caret() && !selection_fits_one_block(doc, &range) {
+        return false;
+    }
     let text = if selected.is_empty() {
-        "text"
+        "text".to_owned()
     } else {
-        selected
+        escape_link_text(&selected)
     };
     let replacement = format!("[{text}](url)");
-    let range = selection.range();
     let url_start = range.start + 1 + text.len() + 2;
     doc.apply_transaction(Transaction::new(
         vec![Edit::replace(range, replacement)],
         Selection::new(url_start, url_start + 3),
         EditKind::Format,
     ))
+}
+
+fn escape_link_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(ch, '\\' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+/// The inline destination of the link surrounding the caret. Ctrl+K on a
+/// finished link edits its URL instead of nesting another link inside it.
+fn link_destination_at(doc: &mut Document, selection: Selection) -> Option<Range<usize>> {
+    let text = doc.text();
+    for block in &doc.parsed().blocks {
+        for marker in &block.markers {
+            if marker.kind != MarkerKind::Link {
+                continue;
+            }
+            let touched = if selection.is_caret() {
+                marker.outer.start <= selection.head && selection.head <= marker.outer.end
+            } else {
+                marker.outer.start < selection.end() && selection.start() < marker.outer.end
+            };
+            if !touched || marker.range.end != marker.outer.end {
+                continue;
+            }
+            let closing = &text[marker.range.clone()];
+            if closing.starts_with("](") && closing.ends_with(')') {
+                return Some(marker.range.start + 2..marker.range.end - 1);
+            }
+            if closing == ">" && text[marker.outer.start..].starts_with('<') {
+                return Some(marker.outer.start + 1..marker.outer.end - 1);
+            }
+        }
+    }
+    None
 }
 
 fn hit_test_local(doc: &Document, layout: &DocumentLayout, local: Pos2) -> usize {
@@ -1573,6 +1980,280 @@ mod tests {
     use super::*;
     use rusk_core::{Document, Selection};
 
+    fn move_once(
+        ui: &mut Ui,
+        layout: &DocumentLayout,
+        doc: &mut Document,
+        direction: f32,
+        extend: bool,
+    ) {
+        let mut goal = None;
+        move_vertical(ui, layout, doc, direction, extend, &mut goal);
+    }
+
+    fn in_ui<R>(f: impl FnOnce(&mut Ui) -> R) -> R {
+        let ctx = egui::Context::default();
+        let mut f = Some(f);
+        let mut value = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            if let Some(f) = f.take() {
+                value = Some(f(ui));
+            }
+        });
+        output.textures_delta.clear();
+        value.expect("ui result")
+    }
+
+    #[test]
+    fn vertical_moves_preserve_the_column_on_a_wrapped_line() {
+        use crate::editor::layout::LayoutEngine;
+        use crate::theme::{Theme, ThemeKind};
+        let ctx = egui::Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut engine = LayoutEngine::default();
+        let text = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu\n\nshort\n";
+        let mut doc = Document::from_text(text);
+        let mut goal = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut layout = engine.build(&ctx, &mut doc, &theme, 600.0, 600.0, None);
+            let first = layout.blocks.first().expect("first block");
+            let target = Pos2::new(layout.content_left + 180.0, first.rect.top() + 10.0);
+            let head = hit_test_local(&doc, &layout, target);
+            doc.set_selection(Selection::caret(head));
+            layout = engine.build(&ctx, &mut doc, &theme, 600.0, 600.0, None);
+            let before = paint::caret_rect_local(&layout, &doc).expect("caret before");
+            let block = block_index_at(&layout, head);
+            move_vertical(ui, &layout, &mut doc, 1.0, false, &mut goal);
+            layout = engine.build(&ctx, &mut doc, &theme, 600.0, 600.0, None);
+            let after = paint::caret_rect_local(&layout, &doc).expect("caret after");
+            assert_eq!(block_index_at(&layout, doc.selection().head), block);
+            assert!(after.top() > before.top());
+            assert!(
+                (after.left() - before.left()).abs() < 2.0,
+                "column drifted from {} to {}",
+                before.left(),
+                after.left()
+            );
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn vertical_moves_keep_the_goal_column_across_a_short_line() {
+        use crate::editor::layout::LayoutEngine;
+        use crate::theme::{Theme, ThemeKind};
+        let ctx = egui::Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut engine = LayoutEngine::default();
+        let text = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november\n\nshort\n\nalpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november\n";
+        let mut doc = Document::from_text(text);
+        let mut goal = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
+            let first = layout.blocks.first().expect("first block");
+            let target = Pos2::new(layout.content_left + 400.0, first.rect.top() + 10.0);
+            let head = hit_test_local(&doc, &layout, target);
+            doc.set_selection(Selection::caret(head));
+            layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
+            let x0 = paint::caret_rect_local(&layout, &doc)
+                .expect("caret")
+                .left();
+            let start_block = block_index_at(&layout, head).expect("block");
+
+            for _ in 0..8 {
+                move_vertical(ui, &layout, &mut doc, 1.0, false, &mut goal);
+                layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
+                if block_index_at(&layout, doc.selection().head) != Some(start_block) {
+                    break;
+                }
+            }
+            move_vertical(ui, &layout, &mut doc, 1.0, false, &mut goal);
+            layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
+            let x2 = paint::caret_rect_local(&layout, &doc)
+                .expect("caret after short line")
+                .left();
+            assert!(
+                (x2 - x0).abs() < 2.0,
+                "goal column drifted from {x0} to {x2}"
+            );
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn bold_toggle_removes_markers_when_the_selection_includes_them() {
+        let mut doc = Document::from_text("A **bold** word");
+        doc.set_selection(Selection::new(2, 10));
+        in_ui(|ui| toggle_wrap(ui, &mut doc, "**"));
+        assert_eq!(doc.text(), "A bold word");
+        assert_eq!(doc.selection(), Selection::new(2, 6));
+    }
+
+    #[test]
+    fn bold_toggle_removes_markers_around_a_caret_inside_bold_text() {
+        let mut doc = Document::from_text("A **bold** word");
+        doc.set_selection(Selection::caret(5));
+        in_ui(|ui| toggle_wrap(ui, &mut doc, "**"));
+        assert_eq!(doc.text(), "A bold word");
+        assert_eq!(doc.selection().head, 3);
+    }
+
+    #[test]
+    fn bold_toggle_wraps_the_word_under_a_caret() {
+        let mut doc = Document::from_text("word");
+        doc.set_selection(Selection::caret(2));
+        in_ui(|ui| toggle_wrap(ui, &mut doc, "**"));
+        assert_eq!(doc.text(), "**word**");
+        assert_eq!(doc.selection().head, 4);
+        in_ui(|ui| toggle_wrap(ui, &mut doc, "**"));
+        assert_eq!(doc.text(), "word");
+        assert_eq!(doc.selection().head, 2);
+    }
+
+    #[test]
+    fn bold_toggle_wraps_a_plain_selection() {
+        let mut doc = Document::from_text("word");
+        doc.set_selection(Selection::new(0, 4));
+        in_ui(|ui| toggle_wrap(ui, &mut doc, "**"));
+        assert_eq!(doc.text(), "**word**");
+        assert_eq!(doc.selection(), Selection::new(2, 6));
+    }
+
+    #[test]
+    fn backspace_at_the_start_of_bold_removes_both_markers() {
+        let mut doc = Document::from_text("A **bold** word");
+        doc.set_selection(Selection::caret(4));
+        assert!(backspace_guarded(&mut doc));
+        assert_eq!(doc.text(), "A bold word");
+        assert_eq!(doc.selection().head, 2);
+    }
+
+    #[test]
+    fn delete_at_the_end_of_bold_removes_both_markers() {
+        let mut doc = Document::from_text("A **bold** word");
+        doc.set_selection(Selection::caret(8));
+        assert!(delete_guarded(&mut doc));
+        assert_eq!(doc.text(), "A bold word");
+        assert_eq!(doc.selection().head, 6);
+    }
+
+    #[test]
+    fn ctrl_k_selects_the_destination_of_an_existing_link() {
+        let mut doc = Document::from_text("[text](https://example.com)");
+        doc.set_selection(Selection::caret(2));
+        assert!(in_ui(|ui| {
+            let _ = ui;
+            insert_link(&mut doc)
+        }));
+        assert_eq!(doc.selection(), Selection::new(7, 26));
+        assert_eq!(doc.text(), "[text](https://example.com)");
+    }
+
+    #[test]
+    fn ctrl_k_selects_the_destination_of_an_autolink() {
+        let mut doc = Document::from_text("<https://example.com>");
+        doc.set_selection(Selection::caret(3));
+        assert!(in_ui(|ui| {
+            let _ = ui;
+            insert_link(&mut doc)
+        }));
+        assert_eq!(doc.selection(), Selection::new(1, 20));
+    }
+
+    #[test]
+    fn ctrl_k_escapes_brackets_in_link_text() {
+        let mut doc = Document::from_text("a]b");
+        doc.set_selection(Selection::new(0, 3));
+        assert!(in_ui(|ui| {
+            let _ = ui;
+            insert_link(&mut doc)
+        }));
+        assert_eq!(doc.text(), "[a\\]b](url)");
+    }
+
+    #[test]
+    fn backspace_at_the_start_of_a_link_removes_the_link_syntax() {
+        let mut doc = Document::from_text("[text](url)");
+        doc.set_selection(Selection::caret(1));
+        assert!(backspace_guarded(&mut doc));
+        assert_eq!(doc.text(), "text");
+        assert_eq!(doc.selection().head, 0);
+    }
+
+    #[test]
+    fn backspace_at_a_heading_start_removes_the_heading_prefix() {
+        let mut doc = Document::from_text("# Heading");
+        doc.set_selection(Selection::caret(2));
+        assert!(backspace_guarded(&mut doc));
+        assert_eq!(doc.text(), "Heading");
+        assert_eq!(doc.selection().head, 0);
+    }
+
+    #[test]
+    fn backspace_at_a_list_start_keeps_the_marker() {
+        let mut doc = Document::from_text("- item");
+        doc.set_selection(Selection::caret(2));
+        assert!(!backspace_guarded(&mut doc));
+        assert_eq!(doc.text(), "- item");
+    }
+
+    #[test]
+    fn backspace_at_a_quote_start_removes_the_quote_marker() {
+        let mut doc = Document::from_text("> quote");
+        doc.set_selection(Selection::caret(2));
+        assert!(backspace_guarded(&mut doc));
+        assert_eq!(doc.text(), "quote");
+    }
+
+    #[test]
+    fn backspace_at_a_quote_start_removes_every_quote_marker() {
+        let mut doc = Document::from_text("> a\n> b\n");
+        doc.set_selection(Selection::caret(2));
+        assert!(backspace_guarded(&mut doc));
+        assert_eq!(doc.text(), "a\nb\n");
+    }
+
+    #[test]
+    fn backspace_at_an_indented_list_start_keeps_the_list() {
+        let mut doc = Document::from_text("   - item");
+        doc.set_selection(Selection::caret(5));
+        assert!(!backspace_guarded(&mut doc));
+        assert_eq!(doc.text(), "   - item");
+    }
+
+    #[test]
+    fn backspace_at_a_task_start_keeps_the_task() {
+        let mut doc = Document::from_text("- [ ] task");
+        doc.set_selection(Selection::caret(6));
+        assert!(!backspace_guarded(&mut doc));
+        assert_eq!(doc.text(), "- [ ] task");
+    }
+
+    #[test]
+    fn deleting_the_visible_text_of_bold_removes_the_empty_markers() {
+        let mut doc = Document::from_text("**bold**");
+        doc.set_selection(Selection::new(2, 6));
+        assert!(backspace_guarded(&mut doc));
+        assert_eq!(doc.text(), "");
+        assert_eq!(doc.selection().head, 0);
+    }
+
+    #[test]
+    fn deleting_the_text_of_a_link_removes_the_link() {
+        let mut doc = Document::from_text("[text](url)");
+        doc.set_selection(Selection::new(1, 5));
+        assert!(backspace_guarded(&mut doc));
+        assert_eq!(doc.text(), "");
+    }
+
+    #[test]
+    fn formatting_does_not_span_paragraphs() {
+        let mut doc = Document::from_text("one\n\ntwo");
+        doc.set_selection(Selection::new(0, 8));
+        in_ui(|ui| toggle_wrap(ui, &mut doc, "**"));
+        assert_eq!(doc.text(), "one\n\ntwo");
+    }
+
     #[test]
     fn arrow_down_leaves_a_code_card() {
         use crate::editor::layout::LayoutEngine;
@@ -1591,7 +2272,7 @@ a
         let mut engine = LayoutEngine::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
-            move_vertical(ui, &layout, &mut doc, 1.0, false);
+            move_once(ui, &layout, &mut doc, 1.0, false);
         });
         output.textures_delta.clear();
         // The closing fence is its own source line under the caret.
@@ -1616,7 +2297,7 @@ a
         let mut engine = LayoutEngine::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
-            move_vertical(ui, &layout, &mut doc, -1.0, false);
+            move_once(ui, &layout, &mut doc, -1.0, false);
         });
         output.textures_delta.clear();
         assert_eq!(doc.selection().head, 1);
@@ -1640,10 +2321,10 @@ a
         let mut engine = LayoutEngine::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let mut layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
-            move_vertical(ui, &layout, &mut doc, 1.0, false);
+            move_once(ui, &layout, &mut doc, 1.0, false);
             assert_eq!(doc.selection().head, 7, "down lands in the table");
             layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
-            move_vertical(ui, &layout, &mut doc, -1.0, false);
+            move_once(ui, &layout, &mut doc, -1.0, false);
             assert_eq!(doc.selection().head, 3, "up lands at the heading end");
         });
         output.textures_delta.clear();
@@ -1667,7 +2348,7 @@ a
         let mut engine = LayoutEngine::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
-            move_vertical(ui, &layout, &mut doc, 1.0, false);
+            move_once(ui, &layout, &mut doc, 1.0, false);
         });
         output.textures_delta.clear();
         assert_eq!(doc.selection().head, 21);
@@ -1691,7 +2372,7 @@ b
         let mut engine = LayoutEngine::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
-            move_vertical(ui, &layout, &mut doc, 1.0, false);
+            move_once(ui, &layout, &mut doc, 1.0, false);
         });
         output.textures_delta.clear();
         assert_eq!(doc.selection().head, 8);
@@ -1767,12 +2448,12 @@ b
     }
 
     #[test]
-    fn backspace_does_not_eat_heading_marker() {
+    fn backspace_at_a_heading_start_removes_the_heading_marker() {
         let mut doc = Document::from_text("# Title");
         doc.set_selection(Selection::caret(2));
-        assert!(!backspace_guarded(&mut doc));
-        assert_eq!(doc.text(), "# Title");
-        assert_eq!(doc.selection().head, 2);
+        assert!(backspace_guarded(&mut doc));
+        assert_eq!(doc.text(), "Title");
+        assert_eq!(doc.selection().head, 0);
     }
 
     #[test]

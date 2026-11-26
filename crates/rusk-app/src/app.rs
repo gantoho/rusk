@@ -266,6 +266,7 @@ impl RuskApp {
         if let Some(range) = target {
             self.doc
                 .set_selection(Selection::new(range.start, range.end));
+            self.editor.reset_vertical_goal();
             self.editor.scroll_to_caret = true;
         }
     }
@@ -302,6 +303,7 @@ impl RuskApp {
         let range = matches[index].clone();
         self.doc
             .set_selection(Selection::new(range.start, range.end));
+        self.editor.reset_vertical_goal();
         self.editor.scroll_to_caret = true;
     }
 
@@ -910,6 +912,7 @@ impl RuskApp {
                     if response.clicked() {
                         let caret = Selection::caret(item.byte);
                         self.doc.set_selection(caret);
+                        self.editor.reset_vertical_goal();
                         self.editor.scroll_to_caret = true;
                         self.editor.request_focus();
                     }
