@@ -150,9 +150,9 @@ fn char_to_byte(text: &str, char_index: usize) -> usize {
         .map_or(text.len(), |(byte, _)| byte)
 }
 
-/// Reveal syntax when the caret/selection is *inside* the construct, not when
-/// it merely touches the far outer boundary. Callers may opt into revealing at
-/// the opening boundary for emphasis/code (but not links/images).
+/// Reveal syntax when the caret/selection is *inside* the construct. Callers
+/// additionally reveal at both outer boundaries for inline constructs, where
+/// a hidden marker still represents a real caret stop.
 fn construct_revealed(reveal: Selection, outer: &Range<usize>, marker: &Range<usize>) -> bool {
     if marker.start < reveal.head && reveal.head < marker.end {
         return true;
@@ -203,14 +203,14 @@ pub fn project(block: &Block, source: &str, reveal: Selection) -> Projection {
     }
 
     for marker in &block.markers {
-        // Links and images stay quiet when the caret merely sits before them;
-        // emphasis/code markers reveal at that boundary too, so the caret the
-        // user sees before the word immediately shows what it is next to.
-        let at_construct_start = reveal.is_caret()
-            && reveal.head == marker.outer.start
-            && !matches!(marker.kind, MarkerKind::Link | MarkerKind::Image);
+        // Both edges of an inline construct are real caret positions even
+        // though the marker bytes are hidden. Reveal there as well as inside,
+        // otherwise the same invisible boundary behaves differently depending
+        // on whether the caret arrived from the left or the right.
+        let at_construct_boundary = reveal.is_caret()
+            && (reveal.head == marker.outer.start || reveal.head == marker.outer.end);
         let touched =
-            at_construct_start || construct_revealed(reveal, &marker.outer, &marker.range);
+            at_construct_boundary || construct_revealed(reveal, &marker.outer, &marker.range);
         if !touched {
             continue;
         }
@@ -340,10 +340,37 @@ mod tests {
     }
 
     #[test]
+    fn links_hide_destination_when_the_caret_is_outside() {
+        let md = "[Rusk](https://example.com) is here";
+        let doc = parse(md);
+        let p = project(&doc.blocks[0], md, Selection::caret(30));
+        assert_eq!(p.text, "Rusk is here");
+        assert_eq!(p.display_to_source(4), 27);
+    }
+
+    #[test]
+    fn link_reveals_at_both_boundaries() {
+        let md = "[Rusk](https://example.com) is here";
+        let doc = parse(md);
+        for head in [0, 27] {
+            let p = project(&doc.blocks[0], md, Selection::caret(head));
+            assert_eq!(p.text, md, "boundary {head}");
+        }
+    }
+
+    #[test]
     fn italic_marker_reveals_at_its_opening_boundary() {
         let md = "A *italic* word";
         let doc = parse(md);
         let p = project(&doc.blocks[0], md, Selection::caret(2));
+        assert_eq!(p.text, "A *italic* word");
+    }
+
+    #[test]
+    fn italic_marker_reveals_at_its_closing_boundary() {
+        let md = "A *italic* word";
+        let doc = parse(md);
+        let p = project(&doc.blocks[0], md, Selection::caret(10));
         assert_eq!(p.text, "A *italic* word");
     }
 
@@ -354,15 +381,6 @@ mod tests {
         let head = md.find("italic").expect("italic") + 2;
         let p = project(&doc.blocks[0], md, Selection::caret(head));
         assert!(p.text.contains("*italic*"), "projection was {}", p.text);
-    }
-
-    #[test]
-    fn links_hide_destination() {
-        let md = "[Rusk](https://example.com) is here";
-        let doc = parse(md);
-        let p = project(&doc.blocks[0], md, Selection::caret(0));
-        assert_eq!(p.text, "Rusk is here");
-        assert_eq!(p.display_to_source(4), 27);
     }
 
     #[test]
