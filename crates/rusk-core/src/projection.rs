@@ -179,6 +179,20 @@ struct Piece {
 /// omitted entirely.
 #[must_use]
 pub fn project(block: &Block, source: &str, reveal: Selection) -> Projection {
+    project_with_completion(block, source, reveal, false)
+}
+
+/// Like [`project`], but a completed inline construct is rendered without its
+/// delimiters even while the caret is inside it. This is used right after the
+/// user types the closing marker; moving the caret or clicking returns to the
+/// normal editing projection.
+#[must_use]
+pub fn project_with_completion(
+    block: &Block,
+    source: &str,
+    reveal: Selection,
+    hide_completed: bool,
+) -> Projection {
     let mut pieces: Vec<Piece> = Vec::new();
 
     for token in &block.tokens {
@@ -207,10 +221,21 @@ pub fn project(block: &Block, source: &str, reveal: Selection) -> Projection {
         // though the marker bytes are hidden. Reveal there as well as inside,
         // otherwise the same invisible boundary behaves differently depending
         // on whether the caret arrived from the left or the right.
+        let closed = hide_completed
+            && block.markers.iter().any(|other| {
+                other.outer == marker.outer && other.range.start == marker.outer.start
+            })
+            && block
+                .markers
+                .iter()
+                .any(|other| other.outer == marker.outer && other.range.end == marker.outer.end);
         let at_construct_boundary = reveal.is_caret()
             && (reveal.head == marker.outer.start || reveal.head == marker.outer.end);
-        let touched =
-            at_construct_boundary || construct_revealed(reveal, &marker.outer, &marker.range);
+        let touched = if closed {
+            false
+        } else {
+            at_construct_boundary || construct_revealed(reveal, &marker.outer, &marker.range)
+        };
         if !touched {
             continue;
         }
@@ -329,6 +354,16 @@ mod tests {
         assert_eq!(p.display_to_source(2), 4);
         assert_eq!(p.display_to_source(6), 10);
         assert_eq!(p.source_to_display(2, true), 2);
+    }
+
+    #[test]
+    fn completed_inline_renders_immediately_when_requested() {
+        let md = "A **bold** word";
+        let doc = parse(md);
+        let editing = project_with_completion(&doc.blocks[0], md, Selection::caret(5), false);
+        assert_eq!(editing.text, "A **bold** word");
+        let rendered = project_with_completion(&doc.blocks[0], md, Selection::caret(5), true);
+        assert_eq!(rendered.text, "A bold word");
     }
 
     #[test]

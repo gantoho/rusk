@@ -25,6 +25,8 @@ pub struct Editor {
     pub last_ime_rect: Option<Rect>,
     vertical_goal_x: Option<f32>,
     pending_language_edit: Option<std::ops::Range<usize>>,
+    hide_completed_inline: bool,
+    draft_fence: Option<usize>,
 }
 
 #[derive(Default)]
@@ -51,6 +53,8 @@ impl Editor {
             last_ime_rect: None,
             vertical_goal_x: None,
             pending_language_edit: None,
+            hide_completed_inline: false,
+            draft_fence: None,
         }
     }
 
@@ -62,6 +66,8 @@ impl Editor {
         self.focus_requested = true;
         self.vertical_goal_x = None;
         self.pending_language_edit = None;
+        self.hide_completed_inline = false;
+        self.draft_fence = None;
     }
 
     pub fn request_focus(&mut self) {
@@ -88,6 +94,8 @@ impl Editor {
             width_px: width.round() as i32,
             mode: doc.mode(),
             dark: theme.kind.is_dark(),
+            hide_completed: self.hide_completed_inline,
+            draft_fence: self.draft_fence,
         }
     }
 
@@ -112,6 +120,8 @@ impl Editor {
         if self.layout.as_ref().is_none_or(|layout| layout.key != key) {
             let layout = {
                 let mut previous = self.layout.take();
+                self.engine.hide_completed = self.hide_completed_inline;
+                self.engine.draft_fence = self.draft_fence;
                 self.engine
                     .build(&ctx, doc, theme, width, min_height, previous.as_mut())
             };
@@ -180,6 +190,8 @@ impl Editor {
                 {
                     let layout = {
                         let mut previous = self.layout.take();
+                        self.engine.hide_completed = self.hide_completed_inline;
+                        self.engine.draft_fence = self.draft_fence;
                         self.engine
                             .build(&ctx, doc, theme, width, min_height, previous.as_mut())
                     };

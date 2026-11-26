@@ -253,8 +253,14 @@ Segment {
 `syntect` + `InspiredGitHub` / `base16-ocean.dark`，只取前景色，背景与字号由 Rusk 控制。布局 job 仍保留源码字符与换行，因此映射是线性的。超长行按词换行；不引入横向滚动是当前简化。
 
 - 已闭合的 fenced code 始终保留卡片，正文直接在卡片内编辑，不再因为光标进入而切换成围栏源码。
+- 在 fence 行末按 Enter 会立即补上闭合 fence 并插入一个空正文行，光标放在正文行，所以 ``` / ```java + Enter 直接得到卡片，输入内容不会贴到闭合 fence 上。
+- 输入 fence 时不再自动补 closer；只有 Enter 或点击离开时才关闭，避免未完成输入提前变成卡片。
+- 输入 fence 时临时插入 closer 并把 block 标记为 draft：draft 期间按源码渲染，避免 unclosed fence 把下方文档吞进代码块；Enter/点击离开后 draft 结束并显示卡片。
+- fence 前如果有正文，会先把 fence 移到下一行再进入 draft/卡片流程。
 - 点击卡片头部的语言标签会打开语言编辑框，修改 fence info string；未闭合的 fence 仍按源码显示。
+- 行内格式：用户刚输入闭合标记后，`project_with_completion` 会立即隐藏标记；再次点击或方向键移动会回到可编辑投影，标记重新显示。
 - 代码块的 fence 本身、缩进和极端语法通过 Source 模式编辑。
+- 光标在卡片前一行按 Delete、或在卡片后一行按 Backspace，会删除整张代码/表格/图片卡片。
 
 ### 图片
 
@@ -269,8 +275,12 @@ Segment {
 - 单元格文本使用独立 galley 排版，hit test、caret 和输入都基于同一份 cell source range。
 - 单元格编辑保存到对应 cell 的源码范围；行列语法仍由解析器维护。
 - 单元格内换行和逐 cell 富文本工具条留作后续。
+- 卡片前一行 Delete / 卡片后一行 Backspace 删除整张卡片，避免删换行时把表格或代码块并进普通段落。
 
 ## 12. 文件、导出与窗口
+
+- 设置：`File → Settings…` / `Ctrl+,` 打开设置面板；语言和主题选择立即生效。
+- 界面语言：`i18n.rs` 用 key 表提供 English / 简体中文；缺失 key 回退英文。切换语言会同时重建 Win32 原生菜单，保证菜单和 egui UI 使用同一语言。
 
 - 打开：UTF-8（去 BOM）；错误进入 Toast / 模态框。
 - 保存：直接写回路径；`Ctrl+S` 无路径时转为另存为。

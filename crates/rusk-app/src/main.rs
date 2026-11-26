@@ -2,6 +2,7 @@
 
 mod app;
 mod editor;
+mod i18n;
 #[cfg(target_os = "windows")]
 mod native_menu;
 mod theme;

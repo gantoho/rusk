@@ -11,6 +11,8 @@ use muda::{
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+use crate::i18n::{Language, t};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuCmd {
     New,
@@ -21,6 +23,7 @@ pub enum MenuCmd {
     CopyHtml,
     Shortcuts,
     About,
+    Settings,
     Quit,
     Undo,
     Redo,
@@ -44,6 +47,7 @@ impl MenuCmd {
             "copy-html" => Self::CopyHtml,
             "shortcuts" => Self::Shortcuts,
             "about" => Self::About,
+            "settings" => Self::Settings,
             "quit" => Self::Quit,
             "undo" => Self::Undo,
             "redo" => Self::Redo,
@@ -71,6 +75,7 @@ pub struct NativeMenu {
     hwnd: isize,
     events: Arc<Mutex<Vec<MenuCmd>>>,
     view: ViewItems,
+    language: Language,
     synced: Cell<Option<(bool, bool, bool)>>,
 }
 
@@ -82,7 +87,7 @@ impl NativeMenu {
         };
         let hwnd = win32.hwnd.get();
 
-        let (menu, view) = build_menu()?;
+        let (menu, view) = build_menu(Language::English)?;
         // SAFETY: `hwnd` is the window eframe created for this app.
         unsafe { menu.init_for_hwnd(hwnd) }.ok()?;
 
@@ -103,6 +108,7 @@ impl NativeMenu {
             hwnd,
             events,
             view,
+            language: Language::English,
             synced: Cell::new(None),
         })
     }
@@ -126,6 +132,24 @@ impl NativeMenu {
         self.view.outline.set_checked(outline);
     }
 
+    pub fn set_language(&mut self, language: Language) {
+        if self.language == language {
+            return;
+        }
+        let Some((menu, view)) = build_menu(language) else {
+            return;
+        };
+        // SAFETY: the HWND stays valid while this menu is attached to it.
+        let _ = unsafe { self.menu.remove_for_hwnd(self.hwnd) };
+        if unsafe { menu.init_for_hwnd(self.hwnd) }.is_err() {
+            return;
+        }
+        self.menu = menu;
+        self.view = view;
+        self.language = language;
+        self.synced.set(None);
+    }
+
     pub fn set_dark(&self, dark: bool) {
         let theme = if dark {
             MenuTheme::Dark
@@ -137,49 +161,50 @@ impl NativeMenu {
     }
 }
 
-fn build_menu() -> Option<(Menu, ViewItems)> {
+fn build_menu(language: Language) -> Option<(Menu, ViewItems)> {
+    let s = |key| t(language, key);
     let ctrl = Modifiers::CONTROL;
     let ctrl_shift = Modifiers::CONTROL | Modifiers::SHIFT;
     let accel = |mods: Modifiers, code: Code| Some(Accelerator::new(mods, code));
 
-    let write = CheckMenuItem::with_id("write-mode", "Write mode", true, true, None);
-    let source = CheckMenuItem::with_id("source-mode", "Source mode", true, false, None);
+    let write = CheckMenuItem::with_id("write-mode", s("write_mode"), true, true, None);
+    let source = CheckMenuItem::with_id("source-mode", s("source_mode"), true, false, None);
     let outline = CheckMenuItem::with_id(
         "outline",
-        "Outline",
+        s("outline"),
         true,
         false,
         accel(ctrl_shift, Code::KeyO),
     );
     let ink = CheckMenuItem::with_id(
         "ink-theme",
-        "Ink theme",
+        s("ink_theme"),
         true,
         false,
         accel(ctrl_shift, Code::KeyD),
     );
 
     let edit = Submenu::with_items(
-        "Edit",
+        s("edit"),
         true,
         &[
-            &MenuItem::with_id("undo", "Undo", true, accel(ctrl, Code::KeyZ)),
-            &MenuItem::with_id("redo", "Redo", true, accel(ctrl, Code::KeyY)),
+            &MenuItem::with_id("undo", s("undo"), true, accel(ctrl, Code::KeyZ)),
+            &MenuItem::with_id("redo", s("redo"), true, accel(ctrl, Code::KeyY)),
             &PredefinedMenuItem::separator(),
-            &MenuItem::with_id("find", "Find…", true, accel(ctrl, Code::KeyF)),
+            &MenuItem::with_id("find", s("find"), true, accel(ctrl, Code::KeyF)),
             &MenuItem::with_id(
                 "find-next",
-                "Find Next",
+                s("find_next"),
                 true,
                 accel(Modifiers::empty(), Code::F3),
             ),
-            &MenuItem::with_id("replace", "Replace…", true, accel(ctrl, Code::KeyH)),
+            &MenuItem::with_id("replace", s("replace"), true, accel(ctrl, Code::KeyH)),
         ],
     )
     .ok()?;
 
     let view = Submenu::with_items(
-        "View",
+        s("view"),
         true,
         &[
             &write,
@@ -193,32 +218,33 @@ fn build_menu() -> Option<(Menu, ViewItems)> {
     .ok()?;
 
     let file = Submenu::with_items(
-        "File",
+        s("file"),
         true,
         &[
-            &MenuItem::with_id("new", "New", true, accel(ctrl, Code::KeyN)),
-            &MenuItem::with_id("open", "Open…", true, accel(ctrl, Code::KeyO)),
+            &MenuItem::with_id("new", s("new"), true, accel(ctrl, Code::KeyN)),
+            &MenuItem::with_id("open", s("open"), true, accel(ctrl, Code::KeyO)),
             &PredefinedMenuItem::separator(),
-            &MenuItem::with_id("save", "Save", true, accel(ctrl, Code::KeyS)),
-            &MenuItem::with_id("save-as", "Save As…", true, accel(ctrl_shift, Code::KeyS)),
+            &MenuItem::with_id("save", s("save"), true, accel(ctrl, Code::KeyS)),
+            &MenuItem::with_id("save-as", s("save_as"), true, accel(ctrl_shift, Code::KeyS)),
             &PredefinedMenuItem::separator(),
             &MenuItem::with_id(
                 "export-html",
-                "Export HTML…",
+                s("export_html"),
                 true,
                 accel(ctrl_shift, Code::KeyE),
             ),
-            &MenuItem::with_id("copy-html", "Copy as HTML", true, None),
+            &MenuItem::with_id("copy-html", s("copy_html"), true, None),
             &PredefinedMenuItem::separator(),
             &MenuItem::with_id(
                 "shortcuts",
-                "Keyboard shortcuts",
+                s("keyboard_shortcuts"),
                 true,
                 accel(Modifiers::empty(), Code::F1),
             ),
-            &MenuItem::with_id("about", "About Rusk", true, None),
+            &MenuItem::with_id("about", s("about"), true, None),
             &PredefinedMenuItem::separator(),
-            &MenuItem::with_id("quit", "Exit", true, None),
+            &MenuItem::with_id("settings", s("settings"), true, None),
+            &MenuItem::with_id("quit", s("exit"), true, None),
         ],
     )
     .ok()?;

@@ -42,10 +42,18 @@ impl super::Editor {
         let primary_down = ui.input(|i| i.pointer.primary_down());
         if primary_pressed {
             self.vertical_goal_x = None;
+            self.hide_completed_inline = false;
         }
 
         if primary_pressed && response.hovered() {
             ui.memory_mut(|memory| memory.request_focus(self.focus_id()));
+            if self.draft_fence.take().is_some() {
+                let _ = open_fence_card_on_enter(doc);
+                return None;
+            }
+            if doc.mode() == rusk_core::ViewMode::Wysiwyg && open_fence_card_on_enter(doc) {
+                return None;
+            }
             if let Some(range) = code_language_at(layout, local) {
                 self.pending_language_edit = Some(range);
                 return None;
@@ -135,18 +143,43 @@ impl super::Editor {
             if !vertical {
                 self.vertical_goal_x = None;
             }
+            let horizontal = matches!(
+                &event,
+                Event::Key {
+                    key: Key::ArrowLeft | Key::ArrowRight | Key::Home | Key::End,
+                    pressed: true,
+                    ..
+                }
+            );
+            if vertical || horizontal {
+                self.hide_completed_inline = false;
+            }
             match event {
                 Event::Text(text) if !text.is_empty() => {
                     let interactive_text =
                         ui.input(|i| !i.modifiers.command && !i.modifiers.ctrl && !i.modifiers.alt);
                     if interactive_text {
                         let text = normalize_newlines(&text);
-                        if insert_typed(doc, &text, EditKind::Insert) {
+                        let typed = if text.chars().all(|ch| ch == '`' || ch == '~') {
+                            // Fence characters are typed literally. Running
+                            // them through insert_typed adds paragraph
+                            // separation/newlines above blocks, which made the
+                            // caret jump before the fence was even committed.
+                            doc.insert_text(&text, EditKind::Insert)
+                        } else {
+                            insert_typed(doc, &text, EditKind::Insert)
+                        };
+                        if typed {
                             changed = true;
+                            self.hide_completed_inline = true;
                             scroll = true;
                             self.ime_preedit.clear();
                             if text.ends_with(['`', '~']) {
-                                auto_close_fence(doc);
+                                if let Some(start) = start_fence_draft(doc, doc.selection().head) {
+                                    self.draft_fence = Some(start);
+                                } else {
+                                    let _ = auto_close_fence(doc);
+                                }
                             }
                         }
                     }
@@ -155,6 +188,7 @@ impl super::Editor {
                     let text = normalize_newlines(&text);
                     if insert_typed(doc, &text, EditKind::Paste) {
                         changed = true;
+                        self.hide_completed_inline = true;
                         scroll = true;
                     }
                 }
@@ -181,6 +215,7 @@ impl super::Editor {
                         self.ime_preedit.clear();
                         if !text.is_empty() && insert_typed(doc, &text, EditKind::Ime) {
                             changed = true;
+                            self.hide_completed_inline = true;
                             scroll = true;
                         }
                     }
@@ -274,7 +309,22 @@ impl super::Editor {
 
                     match key {
                         Key::Enter => {
-                            changed |= handle_enter(doc, layout);
+                            if self.draft_fence.take().is_some() {
+                                let head = doc.selection().head;
+                                let line = doc.buffer().line_of_byte(head);
+                                let line_start = doc.buffer().line_start_byte(line);
+                                let text = doc.text();
+                                let line_end = text[line_start..]
+                                    .find('\n')
+                                    .map_or(text.len(), |offset| line_start + offset);
+                                let newline = if text.contains("\r\n") { 2 } else { 1 };
+                                let body = (line_end + newline).min(doc.len_bytes());
+                                let _ = open_fence_card_on_enter(doc);
+                                doc.set_selection(Selection::caret(body));
+                                changed = true;
+                            } else {
+                                changed |= handle_enter(doc, layout);
+                            }
                             scroll = true;
                         }
                         Key::Tab => {
@@ -502,11 +552,9 @@ fn clamp_to_visible_block(doc: &mut Document, from: usize, to: usize) -> usize {
     to
 }
 
-/// A completed opening fence that swallowed the text below it gets a closing
-/// fence right away, so the rest of the document stays outside the block and
-/// a later fence can never be paired with it. A fence typed at the end of the
-/// document is left alone: it has nothing to swallow, and its author is still
-/// writing the block by hand.
+/// Keep an existing empty fence pair's closing run in sync with its opener.
+/// A newly typed fence is intentionally left unclosed until Enter; closing it
+/// while typing made ``` turn into a rendered card before the user asked.
 fn auto_close_fence(doc: &mut Document) -> bool {
     if doc.mode() != rusk_core::ViewMode::Wysiwyg || !doc.selection().is_caret() {
         return false;
@@ -523,11 +571,6 @@ fn auto_close_fence(doc: &mut Document) -> bool {
     } else {
         line_end
     };
-    let eol = if source.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
     if head != content_end {
         return false;
     }
@@ -541,22 +584,18 @@ fn auto_close_fence(doc: &mut Document) -> bool {
     let Some((closing, empty)) = fenced_block(doc, line_start, line_end) else {
         return false;
     };
-    let fence_text = fence.to_string().repeat(run);
-    let indent_text = &line_text[..indent];
+    // Never create a closing fence just because the caret is at the end of an
+    // open fence that already has content. A card should only appear when the
+    // user presses Enter on the opening line (or explicitly closes the fence).
+    // Creating one here made ``` render immediately, before Enter.
     if !empty {
-        return doc.apply_transaction(Transaction::new(
-            vec![Edit::insert(
-                content_end,
-                format!("{eol}{indent_text}{fence_text}"),
-            )],
-            Selection::caret(head),
-            EditKind::Insert,
-        ));
+        return false;
     }
     // A finished empty block keeps its closer exactly as long as its opener.
     let Some(closing) = closing else {
         return false;
     };
+    let fence_text = fence.to_string().repeat(run);
     let closer_line_start = source[..closing.start]
         .rfind('\n')
         .map_or(0, |offset| offset + 1);
@@ -878,6 +917,9 @@ fn backspace_guarded(doc: &mut Document) -> bool {
         return delete_selection_guarded(doc);
     }
     let head = doc.selection().head;
+    if doc.mode() == rusk_core::ViewMode::Wysiwyg && delete_adjacent_card(doc, head, false) {
+        return true;
+    }
     if doc.mode() == rusk_core::ViewMode::Wysiwyg && collapse_fence(doc) {
         return true;
     }
@@ -934,6 +976,9 @@ fn delete_guarded(doc: &mut Document) -> bool {
         return delete_selection_guarded(doc);
     }
     let head = doc.selection().head;
+    if doc.mode() == rusk_core::ViewMode::Wysiwyg && delete_adjacent_card(doc, head, true) {
+        return true;
+    }
     if doc.mode() == rusk_core::ViewMode::Wysiwyg && in_raw_code(doc, head) {
         return doc.delete_forward();
     }
@@ -956,6 +1001,46 @@ fn delete_guarded(doc: &mut Document) -> bool {
         return false;
     }
     doc.delete_forward()
+}
+
+/// Delete/Backspace on the blank or text line immediately before a rendered
+/// table/code/image card removes the whole card. These blocks have no visible
+/// closing delimiter to put a caret next to, so the normal "delete one
+/// character" rule would either do nothing or corrupt their Markdown.
+fn delete_adjacent_card(doc: &mut Document, head: usize, forward: bool) -> bool {
+    let text = doc.text();
+    let target = doc.parsed().blocks.iter().find_map(|block| {
+        if !matches!(
+            block.kind,
+            BlockKind::Table | BlockKind::CodeBlock(_) | BlockKind::Image(_)
+        ) {
+            return None;
+        }
+        let (range, between) = if forward {
+            if block.range.start < head {
+                return None;
+            }
+            (block.range.clone(), &text[head..block.range.start])
+        } else {
+            if block.range.end > head {
+                return None;
+            }
+            (block.range.clone(), &text[block.range.end..head])
+        };
+        if !between.trim().is_empty() {
+            return None;
+        }
+        Some(range)
+    });
+    let Some(range) = target else {
+        return false;
+    };
+    let caret = range.start.min(doc.len_bytes());
+    doc.apply_transaction(Transaction::new(
+        vec![Edit::delete(range)],
+        Selection::caret(caret),
+        EditKind::Delete,
+    ))
 }
 
 fn block_at_source(doc: &mut Document, pos: usize) -> Option<(usize, usize, bool)> {
@@ -1486,9 +1571,113 @@ fn deleting_break_merges_blocks(doc: &mut Document, start: usize, end: usize) ->
     })
 }
 
+/// While a fence is still being typed it must not swallow the rest of the
+/// document. Insert a temporary closer immediately, keep the caret on the
+/// opener line for the language, and mark the block as a draft: layout keeps
+/// it in source form until Enter or a click finishes it.
+fn start_fence_draft(doc: &mut Document, head: usize) -> Option<usize> {
+    if doc.mode() != rusk_core::ViewMode::Wysiwyg || !doc.selection().is_caret() {
+        return None;
+    }
+    let line = doc.buffer().line_of_byte(head);
+    let line_start = doc.buffer().line_start_byte(line);
+    let source = doc.text();
+    let line_end = source[line_start..]
+        .find('\n')
+        .map_or(source.len(), |offset| line_start + offset);
+    if head != line_end {
+        return None;
+    }
+    let line_text = source[line_start..line_end].trim_end_matches('\r');
+    let (indent, _fence, run) = fence_run(line_text)?;
+    if line_text[indent + run..]
+        .chars()
+        .any(|ch| ch == '`' || ch == '~')
+    {
+        return None;
+    }
+    // A fence line inside an already established code block is a closing
+    // fence, not a new draft. A new opener may have no parsed block of its own
+    // yet (that is exactly the case we must protect), so do not require the
+    // parser to have recognized it here.
+    if let Some(block) = doc
+        .parsed()
+        .blocks
+        .iter()
+        .find(|block| block.range.start < line_start && line_start <= block.range.end)
+        && matches!(block.kind, BlockKind::CodeBlock(_))
+    {
+        return None;
+    }
+    Some(line_start)
+}
+
+/// Pressing Enter at the end of a bare fence line is the moment a code block
+/// becomes a card. Insert its closing fence immediately and leave the caret on
+/// the (empty) body line, so the user never has to hand-write ```.
+fn open_fence_card_on_enter(doc: &mut Document) -> bool {
+    let caret = doc.selection().head;
+    let line = doc.buffer().line_of_byte(caret);
+    let line_start = doc.buffer().line_start_byte(line);
+    let text = doc.text();
+    let line_end = text[line_start..]
+        .find('\n')
+        .map_or(text.len(), |offset| line_start + offset);
+    if caret != line_end {
+        return false;
+    }
+    let line_text = text[line_start..line_end].trim_end_matches('\r');
+    let Some((indent, fence, run)) = fence_run(line_text) else {
+        return false;
+    };
+    if line_text[indent + run..]
+        .chars()
+        .any(|ch| ch == '`' || ch == '~')
+    {
+        return false;
+    }
+    let block = doc.parsed().blocks.iter().find(|block| {
+        matches!(&block.kind, BlockKind::CodeBlock(info) if info.fenced)
+            && block.range.start == line_start
+    });
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let next_line_start = line_end + newline.len();
+    // If the parser already found a closer on the very next line this fence is
+    // already a closed empty block; Enter belongs inside its body.
+    if let Some(block) = block
+        && block.prefix.iter().any(|prefix| {
+            prefix.kind == PrefixKind::Fence
+                && prefix.range.start != block.range.start
+                && text[..prefix.range.start]
+                    .rfind('\n')
+                    .map_or(line_start, |offset| offset + 1)
+                    == next_line_start
+        })
+    {
+        return false;
+    }
+    let indent_text = &line_text[..indent];
+    let closer = fence.to_string().repeat(run);
+    let caret = line_end + newline.len();
+    // Leave one body line between opener and closer. Without it, the caret
+    // would sit before the closing fence on the same line and typed content
+    // would corrupt the closing delimiter (```efa).
+    let insertion = format!("{newline}{newline}{indent_text}{closer}");
+    let result = doc.apply_transaction(Transaction::new(
+        vec![Edit::insert(line_end, insertion)],
+        Selection::caret(caret),
+        EditKind::Insert,
+    ));
+    doc.set_selection(Selection::caret(caret.min(doc.len_bytes())));
+    result
+}
+
 fn handle_enter(doc: &mut Document, layout: &DocumentLayout) -> bool {
     if !doc.selection().is_caret() {
         delete_selection_guarded(doc);
+    }
+    if doc.mode() == rusk_core::ViewMode::Wysiwyg && open_fence_card_on_enter(doc) {
+        return true;
     }
     let caret = doc.selection().head;
     let line = doc.buffer().line_of_byte(caret);
@@ -1966,6 +2155,7 @@ fn code_language_at(layout: &DocumentLayout, local: Pos2) -> Option<Range<usize>
     layout.blocks.iter().find_map(|block| match &block.kind {
         LaidKind::Code {
             label_rect,
+            label_visible: true,
             language_range: Some(range),
             ..
         } if label_rect.contains(local) => Some(range.clone()),
@@ -2522,6 +2712,27 @@ mod tests {
     }
 
     #[test]
+    fn delete_before_a_table_removes_the_table_card() {
+        let text = "before\n\n| h |\n|---|\n| 1 |\n\nafter\n";
+        let mut doc = Document::from_text(text);
+        let table_start = text.find("| h |").unwrap();
+        doc.set_selection(Selection::caret(table_start - 1));
+        assert!(delete_guarded(&mut doc));
+        assert!(!doc.text().contains("| h |"));
+        assert!(doc.text().contains("after"));
+    }
+
+    #[test]
+    fn backspace_after_a_code_card_removes_the_code_card() {
+        let text = "before\n\n```rust\nfn main() {}\n```\n\nafter\n";
+        let mut doc = Document::from_text(text);
+        let after = text.find("after").unwrap();
+        doc.set_selection(Selection::caret(after));
+        assert!(backspace_guarded(&mut doc));
+        assert!(!doc.text().contains("```"));
+    }
+
+    #[test]
     fn formatting_does_not_span_paragraphs() {
         let mut doc = Document::from_text("one\n\ntwo");
         doc.set_selection(Selection::new(0, 8));
@@ -2814,11 +3025,11 @@ b
     }
 
     #[test]
-    fn an_indented_fence_keeps_its_indent_on_the_closer() {
+    fn an_indented_fence_waits_for_enter() {
         let mut doc = Document::from_text("  ```\nkeep");
         doc.set_selection(Selection::caret(5));
-        assert!(auto_close_fence(&mut doc));
-        assert_eq!(doc.text(), "  ```\n  ```\nkeep");
+        assert!(!auto_close_fence(&mut doc));
+        assert_eq!(doc.text(), "  ```\nkeep");
     }
 
     #[test]
@@ -2839,6 +3050,84 @@ b
     }
 
     #[test]
+    fn enter_on_a_fence_before_existing_text_closes_before_it() {
+        let text = "para\n\n```java\n## rest\n";
+        let mut doc = Document::from_text(text);
+        let opening_end = text.find("\n## rest").expect("rest line");
+        doc.set_selection(Selection::caret(opening_end));
+        assert!(open_fence_card_on_enter(&mut doc));
+        assert_eq!(doc.text(), "para\n\n```java\n\n```\n## rest\n");
+        let block = doc
+            .parsed()
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::CodeBlock(_)))
+            .expect("card");
+        let content = block.content.clone();
+        assert!(content.is_empty() || &doc.text()[content] == "\n");
+    }
+
+    #[test]
+    fn fence_draft_starts_even_before_a_heading() {
+        let mut doc = Document::from_text("before\n\n```\n## Try it\n");
+        let fence_end = doc.text().find("```").unwrap() + 3;
+        doc.set_selection(Selection::caret(fence_end));
+        assert_eq!(start_fence_draft(&mut doc, fence_end), Some(fence_end - 3));
+        assert_eq!(doc.text(), "before\n\n```\n## Try it\n");
+    }
+
+    #[test]
+    fn a_fence_typed_after_text_is_not_a_block_opener() {
+        let mut doc = Document::from_text("text```");
+        doc.set_selection(Selection::caret(7));
+        assert_eq!(start_fence_draft(&mut doc, 7), None);
+        assert_eq!(doc.text(), "text```");
+    }
+
+    #[test]
+    fn fence_draft_does_not_touch_source_or_document_below() {
+        let mut doc = Document::from_text("```\n## below\n");
+        doc.set_selection(Selection::caret(3));
+        let start = start_fence_draft(&mut doc, 3).expect("draft");
+        assert_eq!(start, 0);
+        assert_eq!(doc.text(), "```\n## below\n");
+        assert_eq!(doc.selection().head, 3);
+        assert!(matches!(
+            doc.parsed().blocks[0].kind,
+            BlockKind::CodeBlock(_)
+        ));
+    }
+
+    #[test]
+    fn enter_after_a_fence_creates_an_empty_code_card() {
+        let mut doc = Document::from_text("```");
+        doc.set_selection(Selection::caret(3));
+        assert!(open_fence_card_on_enter(&mut doc));
+        assert_eq!(doc.text(), "```\n\n```");
+        assert_eq!(doc.selection().head, 4, "caret starts the card body");
+        let block = doc
+            .parsed()
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::CodeBlock(_)))
+            .expect("code block");
+        let content = block.content.clone();
+        assert!(content.is_empty() || &doc.text()[content] == "\n");
+    }
+
+    #[test]
+    fn enter_after_a_language_fence_keeps_the_language() {
+        let mut doc = Document::from_text("```java");
+        doc.set_selection(Selection::caret(7));
+        assert!(open_fence_card_on_enter(&mut doc));
+        assert_eq!(doc.text(), "```java\n\n```");
+        let BlockKind::CodeBlock(info) = &doc.parsed().blocks[0].kind else {
+            panic!("code block");
+        };
+        assert_eq!(info.language.as_deref(), Some("java"));
+    }
+
+    #[test]
     fn removing_an_empty_fence_removes_its_closer() {
         let mut doc = Document::from_text("```\n```\n");
         doc.set_selection(Selection::caret(3));
@@ -2848,27 +3137,20 @@ b
     }
 
     #[test]
-    fn a_new_fence_never_pairs_with_a_later_fence() {
+    fn a_new_fence_waits_for_enter() {
         let mut doc = Document::from_text("para\n\n```js\nx\n```\n");
         doc.set_selection(Selection::caret(5));
         doc.insert_text("\n```", EditKind::Insert);
-        assert!(auto_close_fence(&mut doc));
-        assert_eq!(doc.text(), "para\n\n```\n```\n```js\nx\n```\n");
-        let fence_blocks = doc
-            .parsed()
-            .blocks
-            .iter()
-            .filter(|b| matches!(b.kind, BlockKind::CodeBlock(_)))
-            .count();
-        assert_eq!(fence_blocks, 2, "the new fence stays separate");
+        assert!(!auto_close_fence(&mut doc));
+        assert_eq!(doc.text(), "para\n\n```\n```js\nx\n```\n");
     }
 
     #[test]
-    fn crlf_fences_keep_crlf() {
+    fn crlf_fences_wait_for_enter() {
         let mut doc = Document::from_text("a\r\n```\r\nx");
         doc.set_selection(Selection::caret(6));
-        assert!(auto_close_fence(&mut doc));
-        assert_eq!(doc.text(), "a\r\n```\r\n```\r\nx");
+        assert!(!auto_close_fence(&mut doc));
+        assert_eq!(doc.text(), "a\r\n```\r\nx");
     }
 
     #[test]
@@ -3037,27 +3319,18 @@ b
     }
 
     #[test]
-    fn the_break_that_separates_text_from_a_table_is_kept() {
+    fn backspace_after_a_table_removes_the_table_card() {
         let text = "| a | b |\n|---|---|\n| 1 | 2 |\n\nbelow\n";
-        for (caret, backspace) in [(31, true), (30, true), (29, false)] {
-            let mut doc = Document::from_text(text);
-            doc.set_selection(Selection::caret(caret));
-            let changed = if backspace {
-                backspace_guarded(&mut doc)
-            } else {
-                delete_guarded(&mut doc)
-            };
-            assert!(!changed, "caret {caret} must not eat the separator");
-            assert_eq!(doc.text(), text);
-            let table = doc
-                .parsed()
+        let mut doc = Document::from_text(text);
+        doc.set_selection(Selection::caret(text.find("below").unwrap()));
+        assert!(backspace_guarded(&mut doc));
+        assert!(
+            !doc.parsed()
                 .blocks
                 .iter()
-                .find(|b| matches!(b.kind, BlockKind::Table))
-                .map(|b| b.content.clone())
-                .expect("still a table");
-            assert_eq!(&doc.text()[table], "| a | b |\n|---|---|\n| 1 | 2 |");
-        }
+                .any(|b| matches!(b.kind, BlockKind::Table))
+        );
+        assert!(doc.text().contains("below"));
     }
 
     #[test]

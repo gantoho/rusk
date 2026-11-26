@@ -11,8 +11,10 @@ use eframe::egui::epaint::text::{LayoutJob, TextWrapping};
 use eframe::egui::{
     self, Color32, Context, FontFamily, FontId, Galley, Pos2, Rect, Stroke, TextFormat, Vec2,
 };
-use rusk_core::markdown::{Block, BlockKind, InlineStyle, ListMarker, PrefixKind, TableData};
-use rusk_core::projection::{Projection, Segment, SegmentKind, project};
+use rusk_core::markdown::{
+    Block, BlockKind, InlineStyle, ListMarker, PrefixKind, TableData, parse,
+};
+use rusk_core::projection::{Projection, Segment, SegmentKind, project_with_completion};
 use rusk_core::{Document, Selection, ViewMode};
 
 use crate::editor::code::CodeHighlighter;
@@ -27,13 +29,46 @@ pub const BOTTOM_PAD: f32 = 90.0;
 /// Minimum distance between two blocks that a collapsed blank line separates.
 const COLLAPSED_BLANK_GAP: f32 = 18.0;
 
-#[derive(Clone, Debug, PartialEq)]
+fn line_range_at(source: &str, start: usize) -> Option<Range<usize>> {
+    if start >= source.len() {
+        return None;
+    }
+    let line_start = source[..start].rfind('\n').map_or(0, |offset| offset + 1);
+    let line_end = source[line_start..]
+        .find('\n')
+        .map_or(source.len(), |offset| line_start + offset);
+    Some(line_start..line_end)
+}
+
+/// Mask draft lines with same-length spaces so block parsing can never let a
+/// half-typed opener consume the blocks below. Line breaks are preserved.
+fn mask_source_lines(source: &str, ranges: &[Range<usize>]) -> String {
+    if ranges.is_empty() {
+        return source.to_owned();
+    }
+    let mut bytes = source.as_bytes().to_vec();
+    for range in ranges {
+        let len = bytes.len();
+        let start = range.start.min(len);
+        let end = range.end.min(len);
+        for byte in &mut bytes[start..end] {
+            if !matches!(*byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| source.to_owned())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LayoutKey {
     pub revision: u64,
     pub selection: Selection,
     pub width_px: i32,
     pub mode: ViewMode,
     pub dark: bool,
+    pub hide_completed: bool,
+    pub draft_fence: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +137,7 @@ pub enum LaidKind {
         bg: Rect,
         label: String,
         label_rect: Rect,
+        label_visible: bool,
         language_range: Option<Range<usize>>,
     },
     /// A fenced code block edited as plain source lines, fences included.
@@ -251,6 +287,8 @@ impl LaidBlock {
 pub struct LayoutEngine {
     pub code: CodeHighlighter,
     pub images: ImageCache,
+    pub hide_completed: bool,
+    pub draft_fence: Option<usize>,
 }
 
 impl Default for LayoutEngine {
@@ -258,6 +296,8 @@ impl Default for LayoutEngine {
         Self {
             code: CodeHighlighter::new(),
             images: ImageCache::default(),
+            hide_completed: false,
+            draft_fence: None,
         }
     }
 }
@@ -277,7 +317,18 @@ impl LayoutEngine {
         let selection = doc.selection();
         let mode = doc.mode();
         let revision = doc.revision();
-        let parsed = doc.parsed();
+        let draft_lines: Vec<Range<usize>> = self
+            .draft_fence
+            .and_then(|start| line_range_at(&text, start))
+            .into_iter()
+            .collect();
+        let render_text = mask_source_lines(&text, &draft_lines);
+        let render_parsed = if draft_lines.is_empty() {
+            None
+        } else {
+            Some(parse(&render_text))
+        };
+        let parsed = render_parsed.as_ref().unwrap_or_else(|| doc.parsed());
 
         let page_width = (width - 48.0)
             .clamp(PAGE_MIN_WIDTH, PAGE_MAX_WIDTH)
@@ -291,6 +342,8 @@ impl LayoutEngine {
             width_px: width.round() as i32,
             mode,
             dark: theme.kind.is_dark(),
+            hide_completed: self.hide_completed,
+            draft_fence: self.draft_fence,
         };
 
         let mut blocks = Vec::new();
@@ -317,12 +370,39 @@ impl LayoutEngine {
                     old.key.width_px == key.width_px
                         && old.key.mode == mode
                         && old.key.dark == key.dark
+                        && old.key.hide_completed == key.hide_completed
+                        && old.key.draft_fence == key.draft_fence
                         && old.meta.len() == old.blocks.len()
                 });
                 let mut next_blank = 0;
                 let mut source_cursor = 0;
                 let mut last_bottom = 0.0;
+                let mut draft_rendered = false;
                 for (index, block) in parsed.blocks.iter().enumerate() {
+                    if !draft_rendered
+                        && let Some(draft) = draft_lines.first()
+                        && draft.start <= block.range.start
+                    {
+                        let laid = draft_line_block(
+                            draft.clone(),
+                            text[..draft.start].bytes().filter(|b| *b == b'\n').count(),
+                            &text,
+                            theme,
+                            content_left,
+                            y,
+                            content_width,
+                            content_left,
+                            content_width,
+                            ctx,
+                        );
+                        y += laid.rect.height();
+                        blocks.push(laid);
+                        meta.push(BlockMeta {
+                            content_hash: 0,
+                            reveal: true,
+                        });
+                        draft_rendered = true;
+                    }
                     let live_source = live_source_view(block, &text, selection);
                     let (top, bottom) = spacing_for(block, blocks.last(), live_source);
                     while next_blank < blanks.len() && blanks[next_blank].start < block.range.start
@@ -378,6 +458,33 @@ impl LayoutEngine {
 
                     let reveal = selection_touches_block(block, selection);
                     let content_hash = block_hash(block, &text);
+                    if !draft_rendered
+                        && let Some(draft) = draft_lines.iter().find(|range| {
+                            block.range.start <= range.end && range.start <= block.range.end
+                        })
+                    {
+                        let laid = draft_line_block(
+                            draft.clone(),
+                            block.line,
+                            &text,
+                            theme,
+                            content_left + (block.quote_depth as f32 * 18.0),
+                            y,
+                            (content_width - block.quote_depth as f32 * 18.0).max(180.0),
+                            content_left,
+                            content_width,
+                            ctx,
+                        );
+                        y += laid.rect.height();
+                        blocks.push(laid);
+                        meta.push(BlockMeta {
+                            content_hash,
+                            reveal: true,
+                        });
+                        draft_rendered = true;
+                        source_cursor = source_cursor.max(block.range.end);
+                        continue;
+                    }
                     if reusable
                         && let Some(old) = previous.as_deref_mut()
                         && let Some(old_meta) = old.meta.get(blocks.len()).copied()
@@ -414,6 +521,8 @@ impl LayoutEngine {
                         content_width,
                         y,
                         live_source,
+                        self.hide_completed,
+                        self.draft_fence,
                         &mut self.code,
                         &mut self.images,
                     );
@@ -425,6 +534,26 @@ impl LayoutEngine {
                         reveal,
                     });
                     source_cursor = source_cursor.max(block.range.end);
+                }
+                if !draft_rendered && let Some(draft) = draft_lines.first() {
+                    let laid = draft_line_block(
+                        draft.clone(),
+                        text[..draft.start].bytes().filter(|b| *b == b'\n').count(),
+                        &text,
+                        theme,
+                        content_left,
+                        y,
+                        content_width,
+                        content_left,
+                        content_width,
+                        ctx,
+                    );
+                    y += laid.rect.height();
+                    blocks.push(laid);
+                    meta.push(BlockMeta {
+                        content_hash: 0,
+                        reveal: true,
+                    });
                 }
                 // Trailing blank lines separate nothing, so they keep their rows.
                 while next_blank < blanks.len() {
@@ -790,6 +919,8 @@ fn build_block(
     content_width: f32,
     y: f32,
     live_source: bool,
+    hide_completed: bool,
+    draft_fence: Option<usize>,
     code: &mut CodeHighlighter,
     images: &mut ImageCache,
 ) -> LaidBlock {
@@ -817,7 +948,7 @@ fn build_block(
                 );
             }
             let (size, line_height) = text_metrics(block, theme);
-            let projection = project(block, source, selection);
+            let projection = project_with_completion(block, source, selection, hide_completed);
             let job = text_job(theme, block, &projection, size, line_height, width);
             let galley = if projection.is_empty() {
                 None
@@ -849,6 +980,20 @@ fn build_block(
             }
         }
         BlockKind::CodeBlock(info) => {
+            if info.fenced && draft_fence == Some(block.range.start) {
+                return draft_fence_block(
+                    block,
+                    block_index,
+                    source,
+                    theme,
+                    x,
+                    y,
+                    width,
+                    content_left,
+                    content_width,
+                    ctx,
+                );
+            }
             if info.fenced && code_raw_view(block, selection) {
                 return code_raw_block(
                     block,
@@ -875,8 +1020,8 @@ fn build_block(
                 Some(ctx.fonts_mut(|fonts| fonts.layout_job(job)))
             };
             let body_height = galley.as_ref().map_or(12.0, |g| g.size().y);
-            let bg_height = 38.0 + body_height + 16.0;
-            let bg = Rect::from_min_size(Pos2::new(x, y), Vec2::new(bg_width, bg_height.max(62.0)));
+            let bg_height = 14.0 + body_height + 14.0;
+            let bg = Rect::from_min_size(Pos2::new(x, y), Vec2::new(bg_width, bg_height.max(40.0)));
             let source_end = block.content.start + display.len();
             let language_range = info
                 .language
@@ -911,23 +1056,26 @@ fn build_block(
                         })
                 });
             let label_rect = Rect::from_min_size(
-                Pos2::new(bg.left() + 26.0, bg.top() + 6.0),
-                Vec2::new((bg_width - 44.0).max(40.0), 18.0),
+                Pos2::new((bg.right() - 126.0).max(bg.left() + 20.0), bg.top() + 5.0),
+                Vec2::new(106.0, 18.0),
             );
+            let label_visible =
+                block.range.start <= selection.head && selection.head <= block.edit_end();
             LaidBlock {
                 block: Some(block_index),
                 source_line: Some(block.line),
                 kind: LaidKind::Code {
                     bg,
-                    label: format!("{}  ·  CODE", language.to_uppercase()),
+                    label: language.to_uppercase(),
                     label_rect,
+                    label_visible,
                     language_range,
                 },
                 rect: Rect::from_min_size(
                     Pos2::new(content_left, y),
                     Vec2::new(content_width, bg.height()),
                 ),
-                text_pos: Pos2::new(bg.left() + 20.0, bg.top() + 38.0),
+                text_pos: Pos2::new(bg.left() + 20.0, bg.top() + 14.0),
                 text_width: bg_width - 40.0,
                 line_height: 23.0,
                 galley,
@@ -959,6 +1107,7 @@ fn build_block(
                     bg,
                     label: "HTML  ·  BLOCK".to_owned(),
                     label_rect: Rect::NOTHING,
+                    label_visible: false,
                     language_range: None,
                 },
                 rect: Rect::from_min_size(
@@ -1215,6 +1364,122 @@ fn code_raw_view(block: &Block, _selection: Selection) -> bool {
         .filter(|p| p.kind == PrefixKind::Fence)
         .count()
         < 2
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draft_line_block(
+    range: Range<usize>,
+    line: usize,
+    source: &str,
+    theme: &Theme,
+    x: f32,
+    y: f32,
+    width: f32,
+    content_left: f32,
+    content_width: f32,
+    ctx: &Context,
+) -> LaidBlock {
+    let display = source
+        .get(range.clone())
+        .unwrap_or_default()
+        .trim_end_matches('\r')
+        .to_owned();
+    let mut job = LayoutJob {
+        wrap: TextWrapping::wrap_at_width(width),
+        break_on_newline: true,
+        keep_trailing_whitespace: true,
+        ..Default::default()
+    };
+    job.append(
+        &display,
+        0.0,
+        TextFormat {
+            font_id: theme.body_font(15.0),
+            color: theme.text,
+            line_height: Some(24.0),
+            ..Default::default()
+        },
+    );
+    let galley = if display.is_empty() {
+        None
+    } else {
+        Some(ctx.fonts_mut(|fonts| fonts.layout_job(job)))
+    };
+    let height = galley.as_ref().map_or(24.0, |g| g.size().y.max(24.0));
+    LaidBlock {
+        block: None,
+        source_line: Some(line),
+        kind: LaidKind::Text { heading: None },
+        rect: Rect::from_min_size(Pos2::new(content_left, y), Vec2::new(content_width, height)),
+        text_pos: Pos2::new(x, y),
+        text_width: width,
+        line_height: 24.0,
+        galley,
+        projection: raw_projection(&display, range.clone()),
+        source_range: range,
+        quote_depth: 0,
+        list_marker: None,
+    }
+}
+
+/// While a fence is a draft, show only its opening line. The temporary closer
+/// lives in the source to protect the blocks below, but it must not read as a
+/// second ``` line in the document.
+#[allow(clippy::too_many_arguments)]
+fn draft_fence_block(
+    block: &Block,
+    block_index: usize,
+    source: &str,
+    theme: &Theme,
+    x: f32,
+    y: f32,
+    width: f32,
+    content_left: f32,
+    content_width: f32,
+    ctx: &Context,
+) -> LaidBlock {
+    let line_end = source[block.range.start..]
+        .find('\n')
+        .map_or(source.len(), |offset| block.range.start + offset);
+    let display = source[block.range.start..line_end]
+        .trim_end_matches('\r')
+        .to_owned();
+    let mut job = LayoutJob {
+        wrap: TextWrapping::wrap_at_width(width),
+        break_on_newline: true,
+        keep_trailing_whitespace: true,
+        ..Default::default()
+    };
+    job.append(
+        &display,
+        0.0,
+        TextFormat {
+            font_id: theme.mono_font(15.0),
+            color: theme.text,
+            line_height: Some(23.0),
+            ..Default::default()
+        },
+    );
+    let galley = if display.is_empty() {
+        None
+    } else {
+        Some(ctx.fonts_mut(|fonts| fonts.layout_job(job)))
+    };
+    let height = galley.as_ref().map_or(23.0, |g| g.size().y.max(23.0));
+    LaidBlock {
+        block: Some(block_index),
+        source_line: Some(block.line),
+        kind: LaidKind::CodeSource,
+        rect: Rect::from_min_size(Pos2::new(content_left, y), Vec2::new(content_width, height)),
+        text_pos: Pos2::new(x, y),
+        text_width: width,
+        line_height: 23.0,
+        galley,
+        projection: raw_projection(&display, block.range.start..line_end),
+        source_range: block.range.start..line_end,
+        quote_depth: block.quote_depth,
+        list_marker: block.list_marker.clone(),
+    }
 }
 
 /// The raw source of a fenced code block, laid out as plain monospace lines
@@ -1662,6 +1927,7 @@ fn image_source_block(
             bg,
             label: "IMAGE  ·  SOURCE".to_owned(),
             label_rect: Rect::NOTHING,
+            label_visible: false,
             language_range: None,
         },
         rect: Rect::from_min_size(
@@ -1856,6 +2122,86 @@ mod tests {
     use crate::editor::paint;
     use crate::theme::{Theme, ThemeKind};
     use rusk_core::EditKind;
+
+    #[test]
+    fn completed_inline_hides_markers_when_the_engine_asks() {
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut engine = LayoutEngine {
+            hide_completed: true,
+            ..LayoutEngine::default()
+        };
+        let mut doc = doc_with_selection("A **bold** word", 5);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
+            let block = layout.blocks.first().expect("paragraph");
+            assert_eq!(block.projection.text, "A bold word");
+            assert!(block.galley.is_some());
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn draft_fence_above_heading_keeps_order() {
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut engine = LayoutEngine {
+            draft_fence: Some(8),
+            ..LayoutEngine::default()
+        };
+        let mut doc = Document::from_text("before\n\n```\n## Try it\nbody\n");
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
+            let draft = layout
+                .blocks
+                .iter()
+                .find(|block| {
+                    matches!(block.kind, LaidKind::Text { heading: None })
+                        && block.source_range.start == 8
+                })
+                .expect("draft line");
+            let heading = layout
+                .blocks
+                .iter()
+                .find(|block| matches!(block.kind, LaidKind::Text { heading: Some(_) }))
+                .expect("heading");
+            assert!(
+                draft.rect.bottom() <= heading.rect.top(),
+                "draft overlaps heading"
+            );
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn draft_fence_shows_only_the_opener() {
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut engine = LayoutEngine {
+            draft_fence: Some(0),
+            ..LayoutEngine::default()
+        };
+        let mut doc = Document::from_text("```\n## below\n");
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
+            let _draft = layout
+                .blocks
+                .iter()
+                .find(|block| {
+                    matches!(block.kind, LaidKind::Text { heading: None })
+                        && block.source_range == (0..3)
+                })
+                .expect("draft line");
+            assert!(
+                layout
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block.kind, LaidKind::Text { heading: Some(_) })),
+                "heading below the draft stays rendered"
+            );
+        });
+        output.textures_delta.clear();
+    }
 
     #[test]
     fn blank_lines_follow_source_lines() {
@@ -2294,7 +2640,7 @@ mod tests {
         assert_eq!(card.source_range, 15..27);
         assert!(matches!(
             &card.kind,
-            LaidKind::Code { label, .. } if label == "RUST  ·  CODE"
+            LaidKind::Code { label, .. } if label == "RUST"
         ));
         if let LaidKind::Code {
             language_range: Some(range),

@@ -290,18 +290,21 @@ fn paint_block_text(ui: &Ui, painter: &Painter, block: &LaidBlock, theme: &Theme
         }
     }
     match &block.kind {
-        LaidKind::Code { bg, label, .. } => {
+        LaidKind::Code {
+            bg,
+            label,
+            label_visible,
+            ..
+        } => {
+            if !label_visible {
+                return;
+            }
             let bg = bg.translate(shift);
-            painter.circle_filled(
-                Pos2::new(bg.left() + 18.0, bg.top() + 15.0),
-                3.0,
-                theme.accent,
-            );
             painter.text(
-                Pos2::new(bg.left() + 28.0, bg.top() + 11.0),
-                Align2::LEFT_TOP,
+                Pos2::new(bg.right() - 16.0, bg.top() + 7.0),
+                Align2::RIGHT_TOP,
                 label,
-                theme.mono_font(10.0),
+                theme.mono_font(9.5),
                 theme.muted,
             );
         }
