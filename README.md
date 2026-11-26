@@ -2,6 +2,9 @@
 
 > 一个原生 Rust Markdown 编辑器。**Markdown 源码是唯一文档**，所见即所得只是源码的投影与装饰。
 
+[![GitHub](https://img.shields.io/badge/GitHub-gantoho%2Frusk-181717?logo=github)](https://github.com/gantoho/rusk)
+[![License: MIT](https://img.shields.io/badge/license-MIT-b15832)](LICENSE)
+
 Rusk 不维护“富文本模型 → 导出 Markdown”的第二套文档，也没有 WebView。它用 `ropey` 保存原始字节，用 `pulldown-cmark` 为每个事件标注源码范围，再把语法标记“隐藏”成排版，把每一次输入写回同一份源码。
 
 ![Rusk 浅色主题](docs/screenshots/light.png)
