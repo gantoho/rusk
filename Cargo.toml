@@ -1,0 +1,17 @@
+[workspace]
+members = ["crates/rusk-core", "crates/rusk-app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+
+[workspace.dependencies]
+rusk-core = { path = "crates/rusk-core" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

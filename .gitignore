@@ -1,0 +1,59 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+*.profraw
+*.profdata
+*.dSYM/
+*.rlib
+*.rmeta
+
+# Local Cargo configuration and caches
+.cargo/
+.cargo-cache/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.iml
+*.code-workspace
+*.suo
+*.user
+.history/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.rej
+*.*.orig
+run.log
+tmp_*.md
+tmp_save.md
+
+# Test screenshots and local output (keep docs/screenshots/**)
+/screenshot*.png
+/*.screenshot.png
+/dist/
+/build/
+/rusk.exe
+/rusk
