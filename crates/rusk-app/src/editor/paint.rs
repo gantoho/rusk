@@ -290,7 +290,7 @@ fn paint_block_text(ui: &Ui, painter: &Painter, block: &LaidBlock, theme: &Theme
                 color,
             );
         }
-        LaidKind::Text { .. } => {}
+        LaidKind::Text { .. } | LaidKind::Blank | LaidKind::Spacer | LaidKind::CodeSource => {}
     }
 }
 
@@ -532,19 +532,7 @@ pub fn caret_rect_local(layout: &DocumentLayout, doc: &Document) -> Option<Rect>
         ));
     }
 
-    let mut candidate: Option<&LaidBlock> = None;
-    for block in &layout.blocks {
-        if block.source_range.start <= head && head <= block.source_range.end {
-            candidate = Some(block);
-            break;
-        }
-        if block.source_range.start <= head {
-            candidate = Some(block);
-        } else {
-            break;
-        }
-    }
-    let block = match candidate {
+    let block = match layout.block_at_source_pos(head) {
         Some(block) => block,
         None => layout.blocks.first().unwrap(),
     };

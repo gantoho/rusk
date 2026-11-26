@@ -2,6 +2,8 @@
 
 mod app;
 mod editor;
+#[cfg(target_os = "windows")]
+mod native_menu;
 mod theme;
 
 use eframe::egui;
@@ -16,6 +18,7 @@ fn main() -> eframe::Result {
             .with_app_id("rusk")
             .with_icon(icon),
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options: wgpu_options(),
         ..Default::default()
     };
     eframe::run_native(
@@ -23,6 +26,20 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(app::RuskApp::new(cc)))),
     )
+}
+
+/// Intel's Vulkan driver (`igvk64.dll`) faults intermittently, so Windows uses
+/// D3D12 instead of wgpu's default Vulkan-first order. Set `WGPU_BACKEND`
+/// (e.g. `vulkan`) to override.
+fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+    let mut config = eframe::egui_wgpu::WgpuConfiguration::default();
+    #[cfg(target_os = "windows")]
+    if std::env::var_os("WGPU_BACKEND").is_none()
+        && let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup
+    {
+        setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+    }
+    config
 }
 
 fn load_icon() -> egui::IconData {

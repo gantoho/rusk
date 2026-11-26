@@ -190,7 +190,9 @@ impl InlineCollector {
     pub fn soft_break(&mut self, range: Range<usize>) {
         let style = self.style();
         self.push_token(InlineToken {
-            text: " ".to_owned(),
+            // A soft break is still a line break in the source, so the
+            // projection shows it as one instead of folding it to a space.
+            text: "\n".to_owned(),
             source: range,
             style,
             kind: TokenKind::Text,

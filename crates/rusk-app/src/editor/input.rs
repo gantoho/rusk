@@ -6,6 +6,7 @@
 use std::ops::Range;
 
 use eframe::egui::{self, Event, ImeEvent, Key, PointerButton, Pos2, Response, Ui};
+use rusk_core::markdown::{BlockKind, PrefixKind};
 use rusk_core::{Document, Edit, EditKind, Selection, Transaction};
 
 use super::layout::{DocumentLayout, LaidBlock, LaidKind};
@@ -83,9 +84,7 @@ impl super::Editor {
         } else if response.triple_clicked_by(PointerButton::Primary) {
             let pos = hit_test_local(doc, layout, pointer - origin.to_vec2());
             let block = layout
-                .blocks
-                .iter()
-                .find(|b| b.source_range.start <= pos && pos <= b.source_range.end)
+                .block_at_source_pos(pos)
                 .or_else(|| layout.blocks.last());
             if let Some(block) = block {
                 doc.set_selection(Selection::new(
@@ -123,16 +122,19 @@ impl super::Editor {
                         ui.input(|i| !i.modifiers.command && !i.modifiers.ctrl && !i.modifiers.alt);
                     if interactive_text {
                         let text = normalize_newlines(&text);
-                        if doc.insert_text(&text, EditKind::Insert) {
+                        if insert_typed(doc, &text, EditKind::Insert) {
                             changed = true;
                             scroll = true;
                             self.ime_preedit.clear();
+                            if text.ends_with(['`', '~']) {
+                                auto_close_fence(doc);
+                            }
                         }
                     }
                 }
                 Event::Paste(text) => {
                     let text = normalize_newlines(&text);
-                    if doc.insert_text(&text, EditKind::Paste) {
+                    if insert_typed(doc, &text, EditKind::Paste) {
                         changed = true;
                         scroll = true;
                     }
@@ -158,7 +160,7 @@ impl super::Editor {
                     }
                     ImeEvent::Commit(text) => {
                         self.ime_preedit.clear();
-                        if !text.is_empty() && doc.insert_text(&text, EditKind::Ime) {
+                        if !text.is_empty() && insert_typed(doc, &text, EditKind::Ime) {
                             changed = true;
                             scroll = true;
                         }
@@ -371,7 +373,20 @@ fn move_horizontal(doc: &mut Document, left: bool, word: bool, extend: bool) {
 /// Keep horizontal caret movement out of hidden block syntax such as `# `,
 /// `- `, `> ` or code fences. Inline syntax can still be reached (and is
 /// revealed by the projection), but block markers are source-mode territory.
+/// A fenced code block is shown as raw source while the caret is inside it,
+/// so nothing in it is hidden syntax that the caret must be kept out of.
+fn in_raw_code(doc: &mut Document, pos: usize) -> bool {
+    doc.parsed().blocks.iter().any(|b| {
+        matches!(&b.kind, BlockKind::CodeBlock(info) if info.fenced)
+            && b.range.start <= pos
+            && pos <= b.edit_end()
+    })
+}
+
 fn clamp_to_visible_block(doc: &mut Document, from: usize, to: usize) -> usize {
+    if in_raw_code(doc, from) {
+        return to;
+    }
     let parsed = doc.parsed();
     let Some(index) = parsed
         .blocks
@@ -405,11 +420,222 @@ fn clamp_to_visible_block(doc: &mut Document, from: usize, to: usize) -> usize {
     to
 }
 
+/// A completed opening fence that swallowed the text below it gets a closing
+/// fence right away, so the rest of the document stays outside the block and
+/// a later fence can never be paired with it. A fence typed at the end of the
+/// document is left alone: it has nothing to swallow, and its author is still
+/// writing the block by hand.
+fn auto_close_fence(doc: &mut Document) -> bool {
+    if doc.mode() != rusk_core::ViewMode::Wysiwyg || !doc.selection().is_caret() {
+        return false;
+    }
+    let head = doc.selection().head;
+    let source = doc.buffer().as_str();
+    let line = doc.buffer().line_of_byte(head);
+    let line_start = doc.buffer().line_start_byte(line);
+    let line_end = source[line_start..]
+        .find('\n')
+        .map_or(source.len(), |offset| line_start + offset);
+    let content_end = if source[line_start..line_end].ends_with('\r') {
+        line_end - 1
+    } else {
+        line_end
+    };
+    let eol = if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    if head != content_end {
+        return false;
+    }
+    let line_text = &source[line_start..content_end];
+    let Some((indent, fence, run)) = fence_run(line_text) else {
+        return false;
+    };
+    if fence == '`' && line_text[indent + run..].contains('`') {
+        return false;
+    }
+    let Some((closing, empty)) = fenced_block(doc, line_start, line_end) else {
+        return false;
+    };
+    let fence_text = fence.to_string().repeat(run);
+    let indent_text = &line_text[..indent];
+    if !empty {
+        return doc.apply_transaction(Transaction::new(
+            vec![Edit::insert(
+                content_end,
+                format!("{eol}{indent_text}{fence_text}"),
+            )],
+            Selection::caret(head),
+            EditKind::Insert,
+        ));
+    }
+    // A finished empty block keeps its closer exactly as long as its opener.
+    let Some(closing) = closing else {
+        return false;
+    };
+    let closer_line_start = source[..closing.start]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    let closer_line_end = source[closer_line_start..]
+        .find('\n')
+        .map_or(source.len(), |offset| closer_line_start + offset);
+    let closer_text = source[closer_line_start..closer_line_end].trim_end_matches('\r');
+    let Some((closer_indent, closer_fence, closer_run)) = fence_run(closer_text) else {
+        return false;
+    };
+    if closer_fence != fence || closer_run >= run {
+        return false;
+    }
+    let run_range =
+        closer_line_start + closer_indent..closer_line_start + closer_indent + closer_run;
+    doc.apply_transaction(Transaction::new(
+        vec![Edit::replace(
+            run_range,
+            format!("{}{fence_text}", &closer_text[..closer_indent]),
+        )],
+        Selection::caret(head),
+        EditKind::Insert,
+    ))
+}
+
+/// Deleting the fence run of an empty fenced block also removes the closing
+/// fence that was added for it, so an abandoned fence cannot leave an orphan
+/// line that swallows whatever follows.
+fn collapse_fence(doc: &mut Document) -> bool {
+    if doc.mode() != rusk_core::ViewMode::Wysiwyg || !doc.selection().is_caret() {
+        return false;
+    }
+    let head = doc.selection().head;
+    if head == 0 {
+        return false;
+    }
+    let source = doc.buffer().as_str();
+    let line = doc.buffer().line_of_byte(head);
+    let line_start = doc.buffer().line_start_byte(line);
+    let line_end = source[line_start..]
+        .find('\n')
+        .map_or(source.len(), |offset| line_start + offset);
+    let line_text = source[line_start..line_end].trim_end_matches('\r');
+    let Some((indent, fence, run)) = fence_run(line_text) else {
+        return false;
+    };
+    let run_start = line_start + indent;
+    if run != 3 || head <= run_start || head > run_start + run {
+        return false;
+    }
+    if !source[..head].ends_with(fence) {
+        return false;
+    }
+    let Some((closing, empty)) = fenced_block(doc, line_start, line_end) else {
+        return false;
+    };
+    let Some(closing) = closing else {
+        return false;
+    };
+    if !empty || line_end >= source.len() {
+        return false;
+    }
+    let closer_start = line_end + 1;
+    let closer_line_start = source[..closing.start]
+        .rfind('\n')
+        .map_or(0, |offset| offset + 1);
+    if closer_line_start != closer_start {
+        return false;
+    }
+    let closer_line_end = source[closer_start..]
+        .find('\n')
+        .map_or(source.len(), |offset| closer_start + offset);
+    let closer_text = source[closer_start..closer_line_end].trim_end_matches('\r');
+    let closer = closer_text.trim();
+    if closer.chars().count() < 3 || !closer.chars().all(|c| c == fence) {
+        return false;
+    }
+    let removed = head - fence.len_utf8();
+    let cut_end = (closer_line_end + usize::from(closer_line_end < source.len())).min(source.len());
+    doc.apply_transaction(Transaction::new(
+        vec![Edit::delete(removed..head), Edit::delete(line_end..cut_end)],
+        Selection::caret(removed),
+        EditKind::Delete,
+    ))
+}
+
+/// The parsed fenced code block starting on the line `line_start..line_end`,
+/// as its closing fence range (when present) and whether its content is empty.
+fn fenced_block(
+    doc: &mut Document,
+    line_start: usize,
+    line_end: usize,
+) -> Option<(Option<Range<usize>>, bool)> {
+    let parsed = doc.parsed();
+    let block = parsed.blocks.iter().find(|b| {
+        matches!(&b.kind, BlockKind::CodeBlock(info) if info.fenced)
+            && b.range.start >= line_start
+            && b.range.start <= line_end
+    })?;
+    let closing = block
+        .prefix
+        .iter()
+        .filter(|p| p.kind == PrefixKind::Fence)
+        .nth(1)
+        .map(|p| p.range.clone());
+    Some((closing, block.content.start == block.content.end))
+}
+
+/// Leading fence run of a line: indentation width, fence character, run length.
+fn fence_run(line: &str) -> Option<(usize, char, usize)> {
+    let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let fence = rest.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let count = rest.chars().take_while(|c| *c == fence).count();
+    if count < 3 {
+        return None;
+    }
+    Some((indent, fence, count))
+}
+
 fn backspace_guarded(doc: &mut Document) -> bool {
     if !doc.selection().is_caret() {
         return doc.backspace();
     }
     let head = doc.selection().head;
+    if doc.mode() == rusk_core::ViewMode::Wysiwyg && collapse_fence(doc) {
+        return true;
+    }
+    if doc.mode() == rusk_core::ViewMode::Wysiwyg && in_raw_code(doc, head) {
+        return doc.backspace();
+    }
+    if doc.mode() == rusk_core::ViewMode::Wysiwyg
+        && let Some((start, end)) = line_break_ending_at(&doc.buffer().as_str(), head)
+        && deleting_break_merges_blocks(doc, start, end)
+    {
+        return false;
+    }
+    if doc.mode() == rusk_core::ViewMode::Wysiwyg
+        && let Some((content_start, content_end, hidden)) = block_at_source(doc, head)
+        && hidden
+        && head == content_start
+        && head == content_end
+    {
+        // An empty item only exists as its marker ("- ", "> ", "# ").
+        // Backspace removes the marker and leaves a plain line, the same
+        // exit the Enter key performs; the generic guard would jump into
+        // the previous block and leave the item behind.
+        let line = doc.buffer().line_of_byte(head);
+        let line_start = doc.buffer().line_start_byte(line);
+        if line_start < head {
+            let selection = Selection::caret(line_start);
+            return doc.apply_transaction(Transaction::new(
+                vec![Edit::delete(line_start..head)],
+                selection,
+                EditKind::Structural,
+            ));
+        }
+    }
     if doc.mode() == rusk_core::ViewMode::Wysiwyg
         && let Some((content_start, _, hidden)) = block_at_source(doc, head)
         && head == content_start
@@ -427,6 +653,15 @@ fn delete_guarded(doc: &mut Document) -> bool {
         return doc.delete_forward();
     }
     let head = doc.selection().head;
+    if doc.mode() == rusk_core::ViewMode::Wysiwyg && in_raw_code(doc, head) {
+        return doc.delete_forward();
+    }
+    if doc.mode() == rusk_core::ViewMode::Wysiwyg
+        && let Some((start, end)) = line_break_starting_at(&doc.buffer().as_str(), head)
+        && deleting_break_merges_blocks(doc, start, end)
+    {
+        return false;
+    }
     if doc.mode() == rusk_core::ViewMode::Wysiwyg
         && let Some((_, content_end, hidden)) = block_at_source(doc, head)
         && head == content_end
@@ -560,12 +795,111 @@ fn move_vertical_by(
         doc.set_selection(select_to(doc, pos, extend));
         return;
     }
-    let pos = if delta < 0.0 && caret.top() < 4.0 {
+    let head = doc.selection().head;
+    let len = doc.len_bytes();
+    let mut pos = if delta < 0.0 && caret.top() < 4.0 {
         0
     } else {
         hit_test_local(doc, layout, target)
     };
+    if stalled(layout, head, pos) {
+        // Padded blocks (code cards, table source, images) and rules map a
+        // step from their first/last row back into the same row. Step to the
+        // neighbouring block instead of standing still.
+        if let Some(index) = block_index_at(layout, head) {
+            pos = neighbour_pos(layout, len, index, delta);
+        }
+    }
+    // Vertical movement must not unfold a blank separator under the caret:
+    // folded separators are spacing, not rows to stop on.
+    pos = skip_folded_blanks(layout, len, pos, delta);
     doc.set_selection(select_to(doc, pos, extend));
+}
+
+/// True when a vertical step came back to where it started, either at the
+/// same byte or on the same visual row of the same block.
+fn stalled(layout: &DocumentLayout, head: usize, pos: usize) -> bool {
+    if pos == head {
+        return true;
+    }
+    let (Some(from), Some(to)) = (block_index_at(layout, head), block_index_at(layout, pos)) else {
+        return false;
+    };
+    if from != to {
+        return false;
+    }
+    let block = &layout.blocks[from];
+    let (Some(start), Some(end)) = (
+        cursor_row_top(block, head),
+        cursor_row_top(&layout.blocks[to], pos),
+    ) else {
+        return false;
+    };
+    start == end
+}
+
+fn cursor_row_top(block: &LaidBlock, pos: usize) -> Option<f32> {
+    let galley = block.galley.as_ref()?;
+    let display = block.projection.source_to_display(pos, true);
+    Some(
+        galley
+            .pos_from_cursor(egui::text::CCursor::new(display))
+            .top(),
+    )
+}
+
+fn block_index_at(layout: &DocumentLayout, pos: usize) -> Option<usize> {
+    layout
+        .block_at_source_pos(pos)
+        .and_then(|block| layout.blocks.iter().position(|b| std::ptr::eq(b, block)))
+}
+
+fn neighbour_pos(layout: &DocumentLayout, len: usize, index: usize, delta: f32) -> usize {
+    if delta < 0.0 {
+        layout.blocks[..index]
+            .last()
+            .map_or(0, |b| b.source_range.end)
+    } else {
+        layout
+            .blocks
+            .get(index + 1)
+            .map_or(len, |b| b.source_range.start)
+    }
+}
+
+fn skip_folded_blanks(layout: &DocumentLayout, len: usize, mut pos: usize, delta: f32) -> usize {
+    for _ in 0..layout.blocks.len() {
+        let Some(index) = block_index_at(layout, pos) else {
+            break;
+        };
+        if !is_folded_blank(layout, index) {
+            break;
+        }
+        let next = neighbour_pos(layout, len, index, delta);
+        if next == pos {
+            break;
+        }
+        pos = next;
+    }
+    pos
+}
+
+fn is_folded_blank(layout: &DocumentLayout, index: usize) -> bool {
+    let block = &layout.blocks[index];
+    match block.kind {
+        LaidKind::Spacer => true,
+        LaidKind::Blank => {
+            block.quote_depth == 0
+                && !matches!(
+                    layout.blocks[..index].last().map(|b| &b.kind),
+                    Some(LaidKind::Blank | LaidKind::Spacer)
+                )
+                && layout.blocks[index + 1..]
+                    .iter()
+                    .any(|b| !matches!(b.kind, LaidKind::Blank))
+        }
+        _ => false,
+    }
 }
 
 const TOP_MARGIN: f32 = 8.0;
@@ -573,6 +907,7 @@ const TOP_MARGIN: f32 = 8.0;
 fn line_home(doc: &mut Document) -> usize {
     let head = doc.selection().head;
     if doc.mode() == rusk_core::ViewMode::Wysiwyg
+        && !in_raw_code(doc, head)
         && let Some((start, _, _)) = block_at_source(doc, head)
     {
         return start;
@@ -595,6 +930,7 @@ fn line_home(doc: &mut Document) -> usize {
 fn line_end(doc: &mut Document) -> usize {
     let head = doc.selection().head;
     if doc.mode() == rusk_core::ViewMode::Wysiwyg
+        && !in_raw_code(doc, head)
         && let Some((_, end, _)) = block_at_source(doc, head)
     {
         return end;
@@ -609,6 +945,189 @@ fn line_end(doc: &mut Document) -> usize {
         end -= 1;
     }
     end
+}
+
+/// Insert typed, pasted, or IME-committed text, without letting a caret on an
+/// empty line change what the surrounding Markdown means. A blank line between
+/// two blocks is the one line Markdown requires (the layout folds it into
+/// spacing), so text typed there becomes a paragraph of its own with a blank
+/// line on either side; on a visible empty row only the block below is kept
+/// apart. Without this the parser silently absorbs the text into a neighbouring
+/// block, or a line above `---` / `===` turns it into a setext heading.
+fn insert_typed(doc: &mut Document, text: &str, kind: EditKind) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let caret = doc.selection().head;
+    let on_empty_line_start = doc.selection().is_caret()
+        && caret
+            == doc
+                .buffer()
+                .line_start_byte(doc.buffer().line_of_byte(caret))
+        && doc.text()[caret..]
+            .split('\n')
+            .next()
+            .is_some_and(|line| line.trim().is_empty());
+    if !on_empty_line_start || doc.mode() != rusk_core::ViewMode::Wysiwyg || in_raw_code(doc, caret)
+    {
+        return doc.insert_text(text, kind);
+    }
+    let collapsed = collapsed_blank_at(doc, caret);
+    let block_below = a_block_starts_below(doc, caret);
+    if !collapsed && !block_below {
+        return doc.insert_text(text, kind);
+    }
+    let newline = if doc.text().contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut insertion = String::new();
+    if collapsed {
+        insertion.push_str(newline);
+    }
+    insertion.push_str(text);
+    let caret_after = caret + insertion.len();
+    if block_below {
+        insertion.push_str(newline);
+    }
+    doc.apply_transaction(Transaction::new(
+        vec![Edit::replace(caret..caret, &insertion)],
+        Selection::caret(caret_after),
+        kind,
+    ))
+}
+
+/// True when `at` is the blank line the layout folds into spacing: the first
+/// blank line of a run between two blocks.
+fn collapsed_blank_at(doc: &mut Document, at: usize) -> bool {
+    if at == 0 {
+        return false;
+    }
+    let text = doc.buffer().as_str();
+    if super::layout::previous_line_is_blank(&text, at) {
+        return false;
+    }
+    let line_end = text[at..]
+        .find('\n')
+        .map_or(text.len(), |offset| at + offset);
+    let blocks: Vec<(usize, usize)> = doc
+        .parsed()
+        .blocks
+        .iter()
+        .map(|block| (block.range.start, block.range.end))
+        .collect();
+    // A blank line inside a code or HTML block is content, not a separator.
+    let inside_block = blocks.iter().any(|(start, end)| *start <= at && at < *end);
+    !inside_block && blocks.iter().any(|(start, _)| *start > line_end)
+}
+
+/// True when the line after the caret's line starts a block. Text typed on the
+/// blank line must then add a line break below itself, or it becomes a lazy
+/// continuation of that block (or its setext underline).
+fn a_block_starts_below(doc: &mut Document, at: usize) -> bool {
+    let line = doc.buffer().line_of_byte(at);
+    let starts: Vec<usize> = doc
+        .parsed()
+        .blocks
+        .iter()
+        .map(|block| block.range.start)
+        .collect();
+    let buffer = doc.buffer();
+    starts
+        .iter()
+        .any(|start| buffer.line_of_byte(*start) == line + 1)
+}
+
+fn setext_underline(line: &str) -> bool {
+    !line.is_empty()
+        && (line.bytes().all(|byte| byte == b'-') || line.bytes().all(|byte| byte == b'='))
+}
+
+/// The line break that ends right before `at`, when `at` sits at a line start.
+fn line_break_ending_at(text: &str, at: usize) -> Option<(usize, usize)> {
+    if at == 0 {
+        return None;
+    }
+    if text[..at].ends_with("\r\n") {
+        Some((at - 2, at))
+    } else if text[..at].ends_with('\n') {
+        Some((at - 1, at))
+    } else {
+        None
+    }
+}
+
+/// The line break that starts at `at`.
+fn line_break_starting_at(text: &str, at: usize) -> Option<(usize, usize)> {
+    if text[at..].starts_with("\r\n") {
+        Some((at, at + 2))
+    } else if text[at..].starts_with('\n') {
+        Some((at, at + 1))
+    } else {
+        None
+    }
+}
+
+fn newline_width(text: &str, at: usize) -> usize {
+    line_break_starting_at(text, at).map_or(0, |(start, end)| end - start)
+}
+
+/// True when deleting the line break `start..end` lets the parser read two
+/// separate blocks as one: text directly under a table becomes one of its rows,
+/// or a text line directly above a `---` / `===` line becomes a setext heading.
+/// Both blank lines are required by Markdown, so the deletion is refused rather
+/// than silently reshaping the document.
+fn deleting_break_merges_blocks(doc: &mut Document, start: usize, end: usize) -> bool {
+    let text = doc.buffer().as_str();
+    let joined_start = text[..start].rfind('\n').map_or(0, |offset| offset + 1);
+    let joined_end = text[end..]
+        .find('\n')
+        .map_or(text.len(), |offset| end + offset);
+    let before = text[joined_start..start].trim_end_matches('\r');
+    let after = text[end..joined_end].trim_end_matches('\r');
+    let joined = format!("{before}{after}");
+    if joined.trim().is_empty() {
+        return false;
+    }
+    let next = text
+        .get(joined_end + 1..)
+        .map(|rest| {
+            rest.split('\n')
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('\r')
+                .trim()
+        })
+        .filter(|line| !line.is_empty());
+
+    if setext_underline(joined.trim()) {
+        // The merged line is the underline itself; the line above it decides.
+        let above_end = joined_start.saturating_sub(1);
+        let above_start = text[..above_end].rfind('\n').map_or(0, |offset| offset + 1);
+        return joined_start > 0 && !text[above_start..above_end].trim().is_empty();
+    }
+    if next.is_some_and(setext_underline) && after.trim().is_empty() {
+        return true;
+    }
+
+    let parsed = doc.parsed();
+    parsed.blocks.iter().any(|block| {
+        if !matches!(block.kind, BlockKind::Table) || block.content.is_empty() {
+            return false;
+        }
+        let last_line_start = text[..block.content.end]
+            .rfind('\n')
+            .map_or(0, |offset| offset + 1);
+        if joined_start == last_line_start {
+            // The break ended the table's last row, so the next line now sits
+            // directly under the table.
+            return next.is_some();
+        }
+        // The merged line now sits directly under the table's last line.
+        let gap = newline_width(&text, block.content.end);
+        gap > 0 && joined_start == block.content.end + gap
+    })
 }
 
 fn handle_enter(doc: &mut Document, layout: &DocumentLayout) -> bool {
@@ -630,7 +1149,12 @@ fn handle_enter(doc: &mut Document, layout: &DocumentLayout) -> bool {
         .blocks
         .iter()
         .find(|b| b.source_range.start <= caret && caret <= b.source_range.end)
-        .is_some_and(|b| matches!(b.kind, LaidKind::Code { .. } | LaidKind::TableSource { .. }));
+        .is_some_and(|b| {
+            matches!(
+                b.kind,
+                LaidKind::Code { .. } | LaidKind::CodeSource | LaidKind::TableSource { .. }
+            )
+        });
     if in_code {
         return doc.insert_text(newline, EditKind::Insert);
     }
@@ -942,6 +1466,11 @@ fn hit_test_local(doc: &Document, layout: &DocumentLayout, local: Pos2) -> usize
             .iter()
             .find(|b| b.rect.top() > block.rect.bottom())
         {
+            if matches!(next.kind, LaidKind::Spacer) {
+                // The space right under a table belongs to the paragraph
+                // slot below it, not to the table's last row.
+                return next.source_range.start;
+            }
             if local.y - block.rect.bottom() < next.rect.top() - local.y {
                 return block.source_range.end;
             }
@@ -953,6 +1482,7 @@ fn hit_test_local(doc: &Document, layout: &DocumentLayout, local: Pos2) -> usize
     match &block.kind {
         LaidKind::Text { .. }
         | LaidKind::Code { .. }
+        | LaidKind::CodeSource
         | LaidKind::TableSource { .. }
         | LaidKind::SourceLine { .. } => {
             if let Some(client) = &block.galley {
@@ -979,7 +1509,7 @@ fn hit_test_local(doc: &Document, layout: &DocumentLayout, local: Pos2) -> usize
             .buffer()
             .next_grapheme(block.source_range.start)
             .min(block.source_range.end),
-        LaidKind::Rule => block.source_range.start,
+        LaidKind::Rule | LaidKind::Blank | LaidKind::Spacer => block.source_range.start,
     }
 }
 
@@ -1042,6 +1572,175 @@ fn is_word_char(ch: char) -> bool {
 mod tests {
     use super::*;
     use rusk_core::{Document, Selection};
+
+    #[test]
+    fn arrow_down_leaves_a_code_card() {
+        use crate::editor::layout::LayoutEngine;
+        use crate::theme::{Theme, ThemeKind};
+        let ctx = egui::Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut doc = Document::from_text(
+            "```
+x
+```
+
+a
+",
+        );
+        doc.set_selection(Selection::caret(4));
+        let mut engine = LayoutEngine::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0);
+            move_vertical(ui, &layout, &mut doc, 1.0, false);
+        });
+        output.textures_delta.clear();
+        // The closing fence is its own source line under the caret.
+        assert_eq!(doc.selection().head, 6);
+    }
+
+    #[test]
+    fn arrow_up_leaves_a_table_card() {
+        use crate::editor::layout::LayoutEngine;
+        use crate::theme::{Theme, ThemeKind};
+        let ctx = egui::Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut doc = Document::from_text(
+            "a
+
+| h |
+|---|
+| 1 |
+",
+        );
+        doc.set_selection(Selection::caret(3));
+        let mut engine = LayoutEngine::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0);
+            move_vertical(ui, &layout, &mut doc, -1.0, false);
+        });
+        output.textures_delta.clear();
+        assert_eq!(doc.selection().head, 1);
+    }
+
+    #[test]
+    fn vertical_moves_skip_the_folded_separator() {
+        use crate::editor::layout::LayoutEngine;
+        use crate::theme::{Theme, ThemeKind};
+        let ctx = egui::Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut doc = Document::from_text(
+            "# A
+
+| h |
+|---|
+| 1 |
+",
+        );
+        doc.set_selection(Selection::caret(2));
+        let mut engine = LayoutEngine::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0);
+            move_vertical(ui, &layout, &mut doc, 1.0, false);
+            assert_eq!(doc.selection().head, 7, "down lands in the table");
+            layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0);
+            move_vertical(ui, &layout, &mut doc, -1.0, false);
+            assert_eq!(doc.selection().head, 3, "up lands at the heading end");
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn arrow_down_leaves_the_last_row_of_a_table_card() {
+        use crate::editor::layout::LayoutEngine;
+        use crate::theme::{Theme, ThemeKind};
+        let ctx = egui::Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut doc = Document::from_text(
+            "a
+
+| h |
+|---|
+| 1 |
+",
+        );
+        doc.set_selection(Selection::caret(20));
+        let mut engine = LayoutEngine::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0);
+            move_vertical(ui, &layout, &mut doc, 1.0, false);
+        });
+        output.textures_delta.clear();
+        assert_eq!(doc.selection().head, 21);
+    }
+
+    #[test]
+    fn arrow_down_from_a_rule_line_moves_on() {
+        use crate::editor::layout::LayoutEngine;
+        use crate::theme::{Theme, ThemeKind};
+        let ctx = egui::Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut doc = Document::from_text(
+            "a
+
+---
+
+b
+",
+        );
+        doc.set_selection(Selection::caret(3));
+        let mut engine = LayoutEngine::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0);
+            move_vertical(ui, &layout, &mut doc, 1.0, false);
+        });
+        output.textures_delta.clear();
+        assert_eq!(doc.selection().head, 8);
+    }
+
+    #[test]
+    fn backspace_removes_an_empty_list_item() {
+        let mut doc = Document::from_text(
+            "- a
+- 
+- b
+",
+        );
+        doc.set_selection(Selection::caret(6));
+        assert!(backspace_guarded(&mut doc));
+        assert_eq!(
+            doc.text(),
+            "- a
+
+- b
+"
+        );
+        assert_eq!(doc.selection().head, 4);
+        assert!(backspace_guarded(&mut doc));
+        assert_eq!(
+            doc.text(),
+            "- a
+- b
+"
+        );
+    }
+
+    #[test]
+    fn backspace_on_a_non_empty_item_still_jumps() {
+        let mut doc = Document::from_text(
+            "- a
+- b
+",
+        );
+        doc.set_selection(Selection::caret(6));
+        assert!(!backspace_guarded(&mut doc));
+        assert_eq!(
+            doc.text(),
+            "- a
+- b
+"
+        );
+        assert_eq!(doc.selection().head, 3);
+    }
 
     #[test]
     fn bullet_prefix_continues() {
@@ -1107,5 +1806,292 @@ mod tests {
         assert!(handle_tab(&mut doc, true));
         assert_eq!(doc.text(), "- item");
         assert_eq!(doc.selection().head, 6);
+    }
+
+    #[test]
+    fn a_fence_at_the_end_is_left_to_its_author() {
+        let mut doc = Document::from_text("first\n");
+        doc.set_selection(Selection::caret(6));
+        doc.insert_text("```", EditKind::Insert);
+        assert!(!auto_close_fence(&mut doc));
+        assert_eq!(doc.text(), "first\n```");
+
+        doc.insert_text("rust", EditKind::Insert);
+        assert!(!auto_close_fence(&mut doc));
+        assert_eq!(doc.text(), "first\n```rust");
+    }
+
+    #[test]
+    fn an_indented_fence_keeps_its_indent_on_the_closer() {
+        let mut doc = Document::from_text("  ```\nkeep");
+        doc.set_selection(Selection::caret(5));
+        assert!(auto_close_fence(&mut doc));
+        assert_eq!(doc.text(), "  ```\n  ```\nkeep");
+    }
+
+    #[test]
+    fn a_longer_fence_extends_its_closer() {
+        let mut doc = Document::from_text("```\n```\n");
+        doc.set_selection(Selection::caret(3));
+        doc.insert_text("`", EditKind::Insert);
+        assert!(auto_close_fence(&mut doc));
+        assert_eq!(doc.text(), "````\n````\n");
+    }
+
+    #[test]
+    fn inline_backticks_do_not_close() {
+        let mut doc = Document::from_text("text ``");
+        doc.set_selection(Selection::caret(7));
+        assert!(!auto_close_fence(&mut doc));
+        assert_eq!(doc.text(), "text ``");
+    }
+
+    #[test]
+    fn removing_an_empty_fence_removes_its_closer() {
+        let mut doc = Document::from_text("```\n```\n");
+        doc.set_selection(Selection::caret(3));
+        assert!(backspace_guarded(&mut doc));
+        assert_eq!(doc.text(), "``");
+        assert_eq!(doc.selection().head, 2);
+    }
+
+    #[test]
+    fn a_new_fence_never_pairs_with_a_later_fence() {
+        let mut doc = Document::from_text("para\n\n```js\nx\n```\n");
+        doc.set_selection(Selection::caret(5));
+        doc.insert_text("\n```", EditKind::Insert);
+        assert!(auto_close_fence(&mut doc));
+        assert_eq!(doc.text(), "para\n\n```\n```\n```js\nx\n```\n");
+        let fence_blocks = doc
+            .parsed()
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.kind, BlockKind::CodeBlock(_)))
+            .count();
+        assert_eq!(fence_blocks, 2, "the new fence stays separate");
+    }
+
+    #[test]
+    fn crlf_fences_keep_crlf() {
+        let mut doc = Document::from_text("a\r\n```\r\nx");
+        doc.set_selection(Selection::caret(6));
+        assert!(auto_close_fence(&mut doc));
+        assert_eq!(doc.text(), "a\r\n```\r\n```\r\nx");
+    }
+
+    #[test]
+    fn enter_in_a_quote_lands_on_a_visible_row_and_takes_text() {
+        let ctx = eframe::egui::Context::default();
+        let theme = crate::theme::Theme::new(crate::theme::ThemeKind::Paper);
+        let mut engine = crate::editor::layout::LayoutEngine::default();
+        let text = "> A quiet page.\n> Move the caret into formatted text.\n\n## Try it\n";
+        let mut doc = Document::from_text(text);
+        let end = text.find("formatted text.").expect("quote text") + "formatted text.".len();
+        doc.set_selection(Selection::caret(end));
+        let build = |engine: &mut crate::editor::layout::LayoutEngine, doc: &mut Document| {
+            let mut built = None;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+                built = Some(engine.build(&ctx, doc, &theme, 900.0, 600.0));
+            });
+            output.textures_delta.clear();
+            built.expect("layout built")
+        };
+
+        let layout = build(&mut engine, &mut doc);
+        assert!(handle_enter(&mut doc, &layout));
+        assert_eq!(&doc.text()[end..], "\n> \n\n## Try it\n");
+        let caret = doc.selection().head;
+        assert_eq!(caret, end + 3, "caret sits after the quote marker");
+
+        let layout = build(&mut engine, &mut doc);
+        let row = layout
+            .block_at_source_pos(caret)
+            .expect("a row for the caret");
+        assert!(matches!(row.kind, LaidKind::Blank));
+        assert_eq!(row.quote_depth, 1);
+        assert_eq!(row.source_range.start, caret);
+
+        assert!(doc.insert_text("more", EditKind::Insert));
+        assert_eq!(
+            &doc.text()[end..],
+            "\n> more\n\n## Try it\n",
+            "typed text becomes the quote's new line"
+        );
+    }
+
+    #[test]
+    fn typing_below_a_table_keeps_the_separator_line() {
+        let mut doc = Document::from_text("| a | b |\n|---|---|\n| 1 | 2 |\n\nbelow\n");
+        doc.set_selection(Selection::caret(30));
+        assert!(insert_typed(&mut doc, "yo", EditKind::Insert));
+        assert_eq!(
+            &doc.text()[20..],
+            "| 1 | 2 |\n\nyo\n\nbelow\n",
+            "the typed line becomes a paragraph of its own"
+        );
+        let table_range = doc
+            .parsed()
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Table))
+            .map(|b| b.content.clone())
+            .expect("still a table");
+        assert_eq!(&doc.text()[table_range], "| a | b |\n|---|---|\n| 1 | 2 |");
+        assert_eq!(doc.selection().head, 33, "caret follows the typed text");
+    }
+
+    #[test]
+    fn typing_on_an_extra_blank_line_keeps_the_block_below_apart() {
+        let mut doc = Document::from_text("| a | b |\n|---|---|\n| 1 | 2 |\n\n\nbelow\n");
+        doc.set_selection(Selection::caret(31));
+        assert!(insert_typed(&mut doc, "yo", EditKind::Insert));
+        assert_eq!(
+            &doc.text()[30..],
+            "\nyo\n\nbelow\n",
+            "the extra blank row keeps its place and the text does not merge into `below`"
+        );
+    }
+
+    #[test]
+    fn crlf_tables_keep_crlf_when_typing_below_them() {
+        let mut doc = Document::from_text("| a | b |\r\n|---|---|\r\n| 1 | 2 |\r\n\r\nbelow\r\n");
+        doc.set_selection(Selection::caret(33));
+        assert!(insert_typed(&mut doc, "yo", EditKind::Insert));
+        assert_eq!(&doc.text()[22..], "| 1 | 2 |\r\n\r\nyo\r\n\r\nbelow\r\n");
+    }
+
+    #[test]
+    fn typing_below_a_quote_or_list_item_keeps_its_separator() {
+        let mut doc = Document::from_text("> a\n\nx\n");
+        doc.set_selection(Selection::caret(4));
+        assert!(insert_typed(&mut doc, "yo", EditKind::Insert));
+        assert_eq!(doc.text(), "> a\n\nyo\n\nx\n");
+
+        let mut doc = Document::from_text("- a\n\nx\n");
+        doc.set_selection(Selection::caret(4));
+        assert!(insert_typed(&mut doc, "yo", EditKind::Insert));
+        assert_eq!(doc.text(), "- a\n\nyo\n\nx\n");
+    }
+
+    #[test]
+    fn typing_between_paragraphs_opens_a_new_paragraph() {
+        let mut doc = Document::from_text("a\n\nb\n");
+        doc.set_selection(Selection::caret(2));
+        assert!(insert_typed(&mut doc, "yo", EditKind::Insert));
+        assert_eq!(doc.text(), "a\n\nyo\n\nb\n");
+    }
+
+    #[test]
+    fn typing_above_a_rule_stays_a_paragraph() {
+        let mut doc = Document::from_text("| a | b |\n|---|---|\n| 1 | 2 |\n\n---\n\nafter\n");
+        doc.set_selection(Selection::caret(30));
+        assert!(insert_typed(&mut doc, "yo", EditKind::Insert));
+        assert_eq!(
+            doc.text(),
+            "| a | b |\n|---|---|\n| 1 | 2 |\n\nyo\n\n---\n\nafter\n"
+        );
+        assert_eq!(doc.selection().head, 33, "caret stays after the typed text");
+        let kinds: Vec<_> = doc.parsed().blocks.iter().map(|b| b.kind.clone()).collect();
+        assert!(
+            kinds.iter().any(|kind| matches!(kind, BlockKind::Rule)),
+            "the rule survives"
+        );
+        assert!(
+            !kinds
+                .iter()
+                .any(|kind| matches!(kind, BlockKind::Heading(_))),
+            "no setext heading eats the rule"
+        );
+
+        let mut doc = Document::from_text("x\n\n---\n\nafter\n");
+        doc.set_selection(Selection::caret(2));
+        assert!(insert_typed(&mut doc, "yo", EditKind::Insert));
+        assert_eq!(doc.text(), "x\n\nyo\n\n---\n\nafter\n");
+        assert!(
+            !doc.parsed()
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Heading(_)))
+        );
+    }
+
+    #[test]
+    fn deleting_the_break_above_a_rule_is_refused() {
+        let text = "x\n\n---\n\nafter\n";
+        // Backspace on the `---` line would leave `x` directly above it.
+        let mut doc = Document::from_text(text);
+        doc.set_selection(Selection::caret(3));
+        assert!(!backspace_guarded(&mut doc));
+        assert_eq!(doc.text(), text);
+
+        // Delete at the end of `x` joins the same break.
+        doc.set_selection(Selection::caret(1));
+        assert!(!delete_guarded(&mut doc));
+        assert_eq!(doc.text(), text);
+        assert!(
+            !doc.parsed()
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, BlockKind::Heading(_)))
+        );
+    }
+
+    #[test]
+    fn an_ordinary_blank_line_still_deletes() {
+        let mut doc = Document::from_text("a\n\nb\n");
+        doc.set_selection(Selection::caret(3));
+        assert!(backspace_guarded(&mut doc));
+        assert_eq!(doc.text(), "a\nb\n");
+    }
+
+    #[test]
+    fn the_break_that_separates_text_from_a_table_is_kept() {
+        let text = "| a | b |\n|---|---|\n| 1 | 2 |\n\nbelow\n";
+        for (caret, backspace) in [(31, true), (30, true), (29, false)] {
+            let mut doc = Document::from_text(text);
+            doc.set_selection(Selection::caret(caret));
+            let changed = if backspace {
+                backspace_guarded(&mut doc)
+            } else {
+                delete_guarded(&mut doc)
+            };
+            assert!(!changed, "caret {caret} must not eat the separator");
+            assert_eq!(doc.text(), text);
+            let table = doc
+                .parsed()
+                .blocks
+                .iter()
+                .find(|b| matches!(b.kind, BlockKind::Table))
+                .map(|b| b.content.clone())
+                .expect("still a table");
+            assert_eq!(&doc.text()[table], "| a | b |\n|---|---|\n| 1 | 2 |");
+        }
+    }
+
+    #[test]
+    fn clicking_the_gap_under_a_table_targets_the_slot_below_it() {
+        let text = "| a | b |\n|---|---|\n| 1 | 2 |\n\nbelow\n";
+        let ctx = eframe::egui::Context::default();
+        let theme = crate::theme::Theme::new(crate::theme::ThemeKind::Paper);
+        let mut doc = Document::from_text(text);
+        doc.set_selection(Selection::caret(text.len() - 1));
+        let mut engine = crate::editor::layout::LayoutEngine::default();
+        let mut built = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+        });
+        output.textures_delta.clear();
+        let layout = built.expect("layout built");
+        let table = layout
+            .blocks
+            .iter()
+            .find(|b| b.source_range.start == 0)
+            .expect("table block");
+        let point = egui::Pos2::new(layout.content_left + 20.0, table.rect.bottom() + 12.0);
+        assert_eq!(
+            hit_test_local(&doc, &layout, point),
+            30,
+            "a click right under the table is not a click inside its last row"
+        );
     }
 }

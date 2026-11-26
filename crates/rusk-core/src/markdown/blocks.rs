@@ -191,6 +191,18 @@ impl Block {
     pub fn is_code(&self) -> bool {
         matches!(self.kind, BlockKind::CodeBlock(_))
     }
+
+    /// Byte offset just past this block's last source character, excluding
+    /// trailing newlines but including a closing fence. A caret at this offset
+    /// is still on the block's last line; one past its line newline is not.
+    #[must_use]
+    pub fn edit_end(&self) -> usize {
+        self.prefix
+            .iter()
+            .filter(|p| p.kind == PrefixKind::Fence)
+            .map(|p| p.range.end)
+            .fold(self.content.end, usize::max)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -955,26 +967,49 @@ fn heading_content(source: &str, range: &Range<usize>) -> (usize, usize, Vec<Pre
     (range.start, range.start + no_newline.len(), prefixes)
 }
 
-/// The content range (between fences) for a fenced code block.
-fn fenced_content_range(source: &str, range: &Range<usize>) -> Range<usize> {
+/// The content range and the closing-fence line (when the fence is closed)
+/// for a fenced code block.
+fn fenced_parts(source: &str, range: &Range<usize>) -> (Range<usize>, Option<Range<usize>>) {
     let raw = &source[range.clone()];
     let Some(first_newline) = raw.find('\n') else {
-        return range.start..range.start;
+        return (range.start..range.start, None);
     };
     let content_start = range.start + first_newline + 1;
-    let trimmed_end = raw.trim_end_matches(['\n', '\r']).len();
-    let mut content_end = range.start + trimmed_end;
-    // If the last line is a closing fence, exclude it.
-    if let Some(last_newline) = source[content_start..content_end].rfind('\n') {
-        let last_line_start = content_start + last_newline + 1;
-        let last_line = source[last_line_start..content_end].trim_start();
-        if last_line.starts_with("```") || last_line.starts_with("~~~") {
-            content_end = source[..last_line_start]
-                .trim_end_matches(['\n', '\r'])
-                .len();
-        }
+    let block_end = range.start + raw.trim_end_matches(['\n', '\r']).len();
+    if content_start >= block_end {
+        return (content_start..content_start, None);
     }
-    content_start.min(content_end)..content_end
+    let last_line_start = source[content_start..block_end]
+        .rfind('\n')
+        .map_or(content_start, |i| content_start + i + 1);
+    let last_line = source[last_line_start..block_end].trim_start();
+    if is_fence_line(last_line) {
+        let content_end = source[..last_line_start]
+            .trim_end_matches(['\n', '\r'])
+            .len()
+            .max(content_start);
+        return (content_start..content_end, Some(last_line_start..range.end));
+    }
+    (content_start..block_end, None)
+}
+
+/// A line that holds nothing but a run of at least three backticks or tildes.
+fn is_fence_line(line: &str) -> bool {
+    let line = line.trim();
+    let mut chars = line.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first != '`' && first != '~' {
+        return false;
+    }
+    let count = line.chars().take_while(|c| *c == first).count();
+    count >= 3 && line[count..].trim().is_empty()
+}
+
+/// The content range (between fences) for a fenced code block.
+fn fenced_content_range(source: &str, range: &Range<usize>) -> Range<usize> {
+    fenced_parts(source, range).0
 }
 
 fn fenced_prefixes(source: &str, range: &Range<usize>) -> Vec<Prefix> {
@@ -986,13 +1021,9 @@ fn fenced_prefixes(source: &str, range: &Range<usize>) -> Vec<Prefix> {
             kind: PrefixKind::Fence,
         });
     }
-    let content_end = fenced_content_range(source, range).end;
-    if content_end < range.end {
-        let start = source[..content_end]
-            .rfind('\n')
-            .map_or(content_end, |i| i + 1);
+    if let (_, Some(closing)) = fenced_parts(source, range) {
         prefixes.push(Prefix {
-            range: start..range.end,
+            range: closing,
             kind: PrefixKind::Fence,
         });
     }
@@ -1131,7 +1162,7 @@ mod tests {
         let md = "> first **bold**\n> second\n";
         let doc = parse(md);
         assert_eq!(doc.blocks.len(), 1);
-        assert_eq!(doc.blocks[0].plain_text(), "first bold second");
+        assert_eq!(doc.blocks[0].plain_text(), "first bold\nsecond");
         assert!(
             doc.blocks[0]
                 .markers
@@ -1164,6 +1195,38 @@ mod tests {
     }
 
     #[test]
+    fn empty_fences_do_not_panic_and_have_no_content() {
+        for md in ["```", "```\n", "```rust", "```rust\n", "```\n```\n"] {
+            let doc = parse(md);
+            let block = &doc.blocks[0];
+            assert!(block.content.is_empty(), "{md:?} content");
+        }
+        let md = "```rust\n```";
+        let doc = parse(md);
+        assert_eq!(doc.blocks[0].content.start, 8);
+        assert_eq!(
+            doc.blocks[0]
+                .prefix
+                .iter()
+                .filter(|p| p.kind == PrefixKind::Fence)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn closing_fence_prefix_starts_on_its_own_line() {
+        let md = "```\ncode\n```\n";
+        let doc = parse(md);
+        let closing = doc.blocks[0]
+            .prefix
+            .iter()
+            .find(|p| p.kind == PrefixKind::Fence && p.range.start > 0)
+            .expect("closing fence");
+        assert_eq!(&md[closing.range.clone()], "```");
+    }
+
+    #[test]
     fn table_rows_are_structured() {
         let md = "| a | b |\n|---|:--:|\n| 1 | 2 |\n";
         let doc = parse(md);
@@ -1171,5 +1234,18 @@ mod tests {
         assert_eq!(table.rows.len(), 2);
         assert_eq!(table.rows[0].cells[0].text, "a");
         assert_eq!(table.rows[1].cells[1].text, "2");
+    }
+
+    #[test]
+    fn edit_end_excludes_the_trailing_newline_but_keeps_closing_fences() {
+        let md = "| a | b |\n|---|---|\n| 1 | 2 |\n\nbelow\n";
+        let doc = parse(md);
+        let table = &doc.blocks[1];
+        assert_eq!(table.edit_end(), table.content.end);
+        assert!(table.edit_end() < table.range.end);
+
+        let md = "```\ncode\n```\n";
+        let doc = parse(md);
+        assert_eq!(doc.blocks[0].edit_end(), 12);
     }
 }

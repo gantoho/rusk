@@ -81,7 +81,7 @@ impl Theme {
                 code_border: Color32::from_rgb(0xE8, 0xE2, 0xD6),
                 inline_code: Color32::from_rgb(0x9B, 0x4B, 0x2C),
                 quote_bar: Color32::from_rgb(0xDD, 0xD4, 0xC5),
-                selection: Color32::from_rgba_premultiplied(0xEB, 0xCD, 0xB8, 0x98),
+                selection: Color32::from_rgba_premultiplied(0x46, 0x23, 0x14, 0x66),
                 caret: Color32::from_rgb(0xB8, 0x5D, 0x33),
                 link: Color32::from_rgb(0x2E, 0x6B, 0x6E),
                 syntax: Color32::from_rgb(0xB0, 0xA7, 0x99),

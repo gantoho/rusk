@@ -47,6 +47,8 @@ pub struct RuskApp {
     close_now: bool,
     relayout_frames: u8,
     last_title: String,
+    #[cfg(target_os = "windows")]
+    native_menu: Option<crate::native_menu::NativeMenu>,
 }
 
 impl RuskApp {
@@ -72,6 +74,16 @@ impl RuskApp {
         editor.reset(true);
         let last_title = window_title(&doc);
 
+        #[cfg(target_os = "windows")]
+        let native_menu = {
+            let menu = crate::native_menu::NativeMenu::install(cc);
+            if let Some(menu) = &menu {
+                menu.set_dark(kind.is_dark());
+                menu.sync(false, kind.is_dark(), false);
+            }
+            menu
+        };
+
         Self {
             doc,
             editor,
@@ -88,6 +100,62 @@ impl RuskApp {
             close_now: false,
             relayout_frames: 0,
             last_title,
+            #[cfg(target_os = "windows")]
+            native_menu,
+        }
+    }
+
+    /// True when Windows draws the File menu, so egui must not draw its own.
+    #[cfg(target_os = "windows")]
+    fn has_native_menu(&self) -> bool {
+        self.native_menu.is_some()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn has_native_menu(&self) -> bool {
+        false
+    }
+
+    #[cfg(target_os = "windows")]
+    fn poll_native_menu(&mut self, ctx: &egui::Context) {
+        use crate::native_menu::MenuCmd;
+        let events = self
+            .native_menu
+            .as_ref()
+            .map(crate::native_menu::NativeMenu::take_events)
+            .unwrap_or_default();
+        for cmd in events {
+            if !matches!(self.modal, Modal::None) {
+                continue;
+            }
+            match cmd {
+                MenuCmd::New => self.confirm(Pending::New),
+                MenuCmd::Open => self.confirm(Pending::Open),
+                MenuCmd::Save => self.save(),
+                MenuCmd::SaveAs => self.save_as(),
+                MenuCmd::ExportHtml => self.export_html(),
+                MenuCmd::CopyHtml => self.copy_html(ctx),
+                MenuCmd::Shortcuts => self.modal = Modal::Shortcuts,
+                MenuCmd::About => self.modal = Modal::About,
+                MenuCmd::Quit => self.confirm(Pending::Close),
+                MenuCmd::WriteMode | MenuCmd::SourceMode => {
+                    let mode = if cmd == MenuCmd::WriteMode {
+                        ViewMode::Wysiwyg
+                    } else {
+                        ViewMode::Source
+                    };
+                    if self.doc.mode() != mode {
+                        self.doc.set_mode(mode);
+                        self.editor.invalidate_layout();
+                        self.editor.request_focus();
+                    }
+                }
+                MenuCmd::ToggleOutline => {
+                    self.outline_open = !self.outline_open;
+                    self.editor.request_focus();
+                }
+                MenuCmd::ToggleTheme => self.toggle_theme(ctx),
+            }
         }
     }
 
@@ -95,10 +163,27 @@ impl RuskApp {
         self.kind = kind;
         self.theme = Theme::new(kind);
         self.theme.install(ctx);
+        #[cfg(target_os = "windows")]
+        if let Some(menu) = &self.native_menu {
+            menu.set_dark(kind.is_dark());
+        }
         self.editor.invalidate_layout();
         // A palette change alters every text color; make sure the layout is
         // rebuilt with the new theme even if the widget pass is mid-frame.
         self.relayout_frames = 3;
+    }
+
+    fn toggle_theme(&mut self, ctx: &egui::Context) {
+        let kind = self.kind.toggled();
+        self.set_theme(ctx, kind);
+        self.set_toast(
+            if kind.is_dark() {
+                "Ink theme"
+            } else {
+                "Paper theme"
+            },
+            false,
+        );
     }
 
     fn set_toast(&mut self, text: impl Into<String>, error: bool) {
@@ -131,16 +216,7 @@ impl RuskApp {
         } else if consume(ctx, Modifiers::COMMAND | Modifiers::SHIFT, Key::O) {
             self.outline_open = !self.outline_open;
         } else if consume(ctx, Modifiers::COMMAND | Modifiers::SHIFT, Key::D) {
-            let kind = self.kind.toggled();
-            self.set_theme(ctx, kind);
-            self.set_toast(
-                if kind.is_dark() {
-                    "Ink theme"
-                } else {
-                    "Paper theme"
-                },
-                false,
-            );
+            self.toggle_theme(ctx);
         } else if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F1)) {
             self.modal = Modal::Shortcuts;
         }
@@ -290,44 +366,46 @@ impl RuskApp {
                     .color(theme.text),
             );
             ui.add_space(2.0);
-            ui.menu_button(RichText::new("File").size(13.0).color(theme.muted), |ui| {
-                ui.set_min_width(210.0);
-                if menu_item(ui, "New", "Ctrl+N").clicked() {
-                    self.confirm(Pending::New);
-                    ui.close();
-                }
-                if menu_item(ui, "Open…", "Ctrl+O").clicked() {
-                    self.confirm(Pending::Open);
-                    ui.close();
-                }
-                ui.separator();
-                if menu_item(ui, "Save", "Ctrl+S").clicked() {
-                    self.save();
-                    ui.close();
-                }
-                if menu_item(ui, "Save As…", "Ctrl+Shift+S").clicked() {
-                    self.save_as();
-                    ui.close();
-                }
-                ui.separator();
-                if menu_item(ui, "Export HTML…", "Ctrl+Shift+E").clicked() {
-                    self.export_html();
-                    ui.close();
-                }
-                if menu_item(ui, "Copy as HTML", "").clicked() {
-                    self.copy_html(ctx);
-                    ui.close();
-                }
-                ui.separator();
-                if menu_item(ui, "Keyboard shortcuts", "F1").clicked() {
-                    self.modal = Modal::Shortcuts;
-                    ui.close();
-                }
-                if menu_item(ui, "About Rusk", "").clicked() {
-                    self.modal = Modal::About;
-                    ui.close();
-                }
-            });
+            if !self.has_native_menu() {
+                ui.menu_button(RichText::new("File").size(13.0).color(theme.muted), |ui| {
+                    ui.set_min_width(210.0);
+                    if menu_item(ui, "New", "Ctrl+N").clicked() {
+                        self.confirm(Pending::New);
+                        ui.close();
+                    }
+                    if menu_item(ui, "Open…", "Ctrl+O").clicked() {
+                        self.confirm(Pending::Open);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if menu_item(ui, "Save", "Ctrl+S").clicked() {
+                        self.save();
+                        ui.close();
+                    }
+                    if menu_item(ui, "Save As…", "Ctrl+Shift+S").clicked() {
+                        self.save_as();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if menu_item(ui, "Export HTML…", "Ctrl+Shift+E").clicked() {
+                        self.export_html();
+                        ui.close();
+                    }
+                    if menu_item(ui, "Copy as HTML", "").clicked() {
+                        self.copy_html(ctx);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if menu_item(ui, "Keyboard shortcuts", "F1").clicked() {
+                        self.modal = Modal::Shortcuts;
+                        ui.close();
+                    }
+                    if menu_item(ui, "About Rusk", "").clicked() {
+                        self.modal = Modal::About;
+                        ui.close();
+                    }
+                });
+            }
 
             ui.add_space(4.0);
             ui.label(
@@ -365,20 +443,22 @@ impl RuskApp {
                     self.outline_open = !self.outline_open;
                     self.editor.request_focus();
                 }
-                ui.add_space(4.0);
-                ui.menu_button(
-                    RichText::new("Export").size(12.5).color(theme.muted),
-                    |ui| {
-                        if menu_item(ui, "HTML file…", "Ctrl+Shift+E").clicked() {
-                            self.export_html();
-                            ui.close();
-                        }
-                        if menu_item(ui, "Copy HTML", "").clicked() {
-                            self.copy_html(ctx);
-                            ui.close();
-                        }
-                    },
-                );
+                if !self.has_native_menu() {
+                    ui.add_space(4.0);
+                    ui.menu_button(
+                        RichText::new("Export").size(12.5).color(theme.muted),
+                        |ui| {
+                            if menu_item(ui, "HTML file…", "Ctrl+Shift+E").clicked() {
+                                self.export_html();
+                                ui.close();
+                            }
+                            if menu_item(ui, "Copy HTML", "").clicked() {
+                                self.copy_html(ctx);
+                                ui.close();
+                            }
+                        },
+                    );
+                }
             });
             let rect = ui.max_rect();
             ui.painter().line_segment(
@@ -407,17 +487,8 @@ impl RuskApp {
                 .circle_filled(center + Vec2::new(2.5, -1.5), 6.5, theme.accent);
         }
         if response.clicked() {
-            let kind = self.kind.toggled();
-            self.set_theme(ui.ctx(), kind);
+            self.toggle_theme(ui.ctx());
             self.editor.request_focus();
-            self.set_toast(
-                if kind.is_dark() {
-                    "Ink theme"
-                } else {
-                    "Paper theme"
-                },
-                false,
-            );
         }
     }
 
@@ -815,6 +886,8 @@ impl eframe::App for RuskApp {
             self.editor.invalidate_layout();
         }
 
+        #[cfg(target_os = "windows")]
+        self.poll_native_menu(&ctx);
         self.handle_shortcuts(&ctx);
         self.handle_close(&ctx);
         if self.close_now {
@@ -828,14 +901,16 @@ impl eframe::App for RuskApp {
             self.confirm(Pending::OpenPath(path));
         }
 
-        egui::Panel::top("rusk-top")
-            .exact_size(54.0)
-            .frame(
-                Frame::new()
-                    .fill(theme.panel)
-                    .inner_margin(Margin::symmetric(18, 0)),
-            )
-            .show(ui, |ui| self.top_bar(ui, &ctx));
+        if !self.has_native_menu() {
+            egui::Panel::top("rusk-top")
+                .exact_size(54.0)
+                .frame(
+                    Frame::new()
+                        .fill(theme.panel)
+                        .inner_margin(Margin::symmetric(18, 0)),
+                )
+                .show(ui, |ui| self.top_bar(ui, &ctx));
+        }
 
         let body = ui.available_rect_before_wrap();
         let footer_height = 30.0;
@@ -899,6 +974,14 @@ impl eframe::App for RuskApp {
         self.dialogs(&ctx);
         self.toast(&ctx);
         self.window_chrome(&ctx);
+        #[cfg(target_os = "windows")]
+        if let Some(menu) = &self.native_menu {
+            menu.sync(
+                self.doc.mode() == ViewMode::Source,
+                self.kind.is_dark(),
+                self.outline_open,
+            );
+        }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

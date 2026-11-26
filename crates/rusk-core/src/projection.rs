@@ -370,4 +370,15 @@ mod tests {
             .expect("footnote segment");
         assert_eq!(footnote.kind, SegmentKind::Text);
     }
+
+    #[test]
+    fn soft_break_stays_a_line_break_in_the_projection() {
+        let md = "one\ntwo";
+        let doc = parse(md);
+        let p = project(&doc.blocks[0], md, Selection::caret(0));
+        assert_eq!(p.text, "one\ntwo");
+        assert_eq!(p.display_to_source(3), 3);
+        assert_eq!(p.display_to_source(4), 4);
+        assert_eq!(p.source_to_display(4, true), 4);
+    }
 }

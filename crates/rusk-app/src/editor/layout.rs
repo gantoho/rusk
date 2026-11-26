@@ -10,7 +10,7 @@ use eframe::egui::epaint::text::{LayoutJob, TextWrapping};
 use eframe::egui::{
     self, Color32, Context, FontFamily, FontId, Pos2, Rect, Stroke, TextFormat, Vec2,
 };
-use rusk_core::markdown::{Block, BlockKind, InlineStyle, ListMarker, TableData};
+use rusk_core::markdown::{Block, BlockKind, InlineStyle, ListMarker, PrefixKind, TableData};
 use rusk_core::projection::{Projection, Segment, SegmentKind, project};
 use rusk_core::{Document, Selection, ViewMode};
 
@@ -23,6 +23,8 @@ pub const PAGE_MIN_WIDTH: f32 = 520.0;
 pub const PAGE_SIDE_PAD: f32 = 64.0;
 pub const TOP_PAD: f32 = 54.0;
 pub const BOTTOM_PAD: f32 = 90.0;
+/// Minimum distance between two blocks that a collapsed blank line separates.
+const COLLAPSED_BLANK_GAP: f32 = 18.0;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayoutKey {
@@ -42,6 +44,22 @@ pub struct DocumentLayout {
     pub blocks: Vec<LaidBlock>,
     pub mode: ViewMode,
     pub empty: bool,
+}
+
+impl DocumentLayout {
+    /// The block that owns a source position. When blocks touch at a
+    /// boundary, the later one wins so a caret on a blank line stays on it.
+    #[must_use]
+    pub fn block_at_source_pos(&self, head: usize) -> Option<&LaidBlock> {
+        let mut candidate = None;
+        for block in &self.blocks {
+            if block.source_range.start > head {
+                break;
+            }
+            candidate = Some(block);
+        }
+        candidate
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -66,13 +84,35 @@ pub struct LaidBlock {
 
 #[derive(Clone, Debug)]
 pub enum LaidKind {
-    Text { heading: Option<u8> },
-    Code { bg: Rect, label: String },
-    TableGrid { grid: TableGrid },
-    TableSource { bg: Rect },
-    ImageBlock { image: ImageBlock },
+    Text {
+        heading: Option<u8>,
+    },
+    Code {
+        bg: Rect,
+        label: String,
+    },
+    /// A fenced code block edited as plain source lines, fences included.
+    CodeSource,
+    TableGrid {
+        grid: TableGrid,
+    },
+    TableSource {
+        bg: Rect,
+    },
+    ImageBlock {
+        image: ImageBlock,
+    },
     Rule,
-    SourceLine { number: usize, current: bool },
+    SourceLine {
+        number: usize,
+        current: bool,
+    },
+    /// A blank source line, rendered as an empty row so the projection keeps
+    /// the source's line structure.
+    Blank,
+    /// The blank line that ends a table. Markdown needs it, but it reads as
+    /// spacing under the card rather than as an empty line of its own.
+    Spacer,
 }
 
 #[derive(Clone, Debug)]
@@ -166,8 +206,34 @@ impl LayoutEngine {
                 );
             }
             ViewMode::Wysiwyg => {
+                let blanks = blank_lines(&text);
+                let mut next_blank = 0;
+                let mut source_cursor = 0;
+                let mut last_bottom = 0.0;
                 for (index, block) in parsed.blocks.iter().enumerate() {
-                    let (top, bottom) = spacing_for(block, blocks.last());
+                    let live_source = live_source_view(block, &text, selection);
+                    let (top, bottom) = spacing_for(block, blocks.last(), live_source);
+                    while next_blank < blanks.len() && blanks[next_blank].start < block.range.start
+                    {
+                        let blank = blanks[next_blank];
+                        next_blank += 1;
+                        if blank.start >= source_cursor {
+                            // The first blank line of a run is the separator the
+                            // parser needs; it reads as spacing, not as a row.
+                            let spacer = (index > 0)
+                                .then(|| separator_gap(&text, &blank, last_bottom, top, selection))
+                                .flatten();
+                            push_blank_line(
+                                &mut blocks,
+                                content_left,
+                                content_width,
+                                &mut y,
+                                blank,
+                                spacer,
+                            );
+                            source_cursor = blank.start;
+                        }
+                    }
                     y += top;
                     let laid = build_block(
                         ctx,
@@ -180,11 +246,30 @@ impl LayoutEngine {
                         content_left,
                         content_width,
                         y,
+                        live_source,
                         &mut self.code,
                         &mut self.images,
                     );
                     y += laid.rect.height() + bottom;
+                    last_bottom = bottom;
                     blocks.push(laid);
+                    source_cursor = source_cursor.max(block.range.end);
+                }
+                // Trailing blank lines separate nothing, so they keep their rows.
+                while next_blank < blanks.len() {
+                    let blank = blanks[next_blank];
+                    next_blank += 1;
+                    if blank.start >= source_cursor {
+                        push_blank_line(
+                            &mut blocks,
+                            content_left,
+                            content_width,
+                            &mut y,
+                            blank,
+                            None,
+                        );
+                        source_cursor = blank.start;
+                    }
                 }
             }
         }
@@ -202,10 +287,191 @@ impl LayoutEngine {
     }
 }
 
-fn spacing_for(block: &Block, previous: Option<&LaidBlock>) -> (f32, f32) {
+/// A source line with no content of its own: fully blank lines and lines
+/// holding nothing but quote markers. The parser drops both, so without an
+/// entry of their own the caret has nowhere to sit. The first blank line of a
+/// run between two blocks becomes a spacer; the rest keep their row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlankLine {
+    /// Byte offset of the line start.
+    start: usize,
+    /// Byte offset where typing on this line belongs, after quote markers.
+    content: usize,
+    quote_depth: usize,
+}
+
+/// Lines whose content is empty (including the line after a trailing
+/// newline, matching source-mode line numbering).
+fn blank_lines(text: &str) -> Vec<BlankLine> {
+    let mut blanks = Vec::new();
+    let mut start = 0;
+    for line in text.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\n', '\r']);
+        if content.trim().is_empty() {
+            blanks.push(BlankLine {
+                start,
+                content: start,
+                quote_depth: 0,
+            });
+        } else if let Some(depth) = quote_only_prefix(content) {
+            blanks.push(BlankLine {
+                start,
+                content: start + content.len(),
+                quote_depth: depth,
+            });
+        }
+        start += line.len();
+    }
+    if text.ends_with('\n') {
+        blanks.push(BlankLine {
+            start: text.len(),
+            content: text.len(),
+            quote_depth: 0,
+        });
+    }
+    blanks
+}
+
+/// For a line made only of quote markers (`>`, `> `, `> >`), the nesting
+/// depth. Anything after the markers means the line has real content and the
+/// parser keeps it.
+fn quote_only_prefix(line: &str) -> Option<usize> {
+    let mut depth = 0;
+    let mut rest = line;
+    loop {
+        let spaces = rest.len() - rest.trim_start_matches(' ').len();
+        if spaces > 3 {
+            return None;
+        }
+        rest = &rest[spaces..];
+        let Some(after) = rest.strip_prefix('>') else {
+            break;
+        };
+        depth += 1;
+        rest = after.strip_prefix(' ').unwrap_or(after);
+    }
+    if depth > 0 && rest.trim().is_empty() {
+        Some(depth)
+    } else {
+        None
+    }
+}
+
+/// A blank line that separates two blocks is the one empty line Markdown
+/// requires; it reads as spacing. `None` means the line keeps a visible row.
+/// The spacer tops the two blocks' own margins up to `COLLAPSED_BLANK_GAP`, so
+/// cards and rules that already carry a large margin keep their tighter look.
+///
+/// A line the caret or selection touches always keeps its row: folding under
+/// the caret would move everything below while typing on it.
+fn separator_gap(
+    text: &str,
+    blank: &BlankLine,
+    last_bottom: f32,
+    next_top: f32,
+    selection: Selection,
+) -> Option<f32> {
+    let truly_blank = blank.quote_depth == 0 && blank.content == blank.start;
+    if !truly_blank
+        || previous_line_is_blank(text, blank.start)
+        || selection_touches_line(selection, text, blank.start)
+    {
+        return None;
+    }
+    Some((COLLAPSED_BLANK_GAP - last_bottom - next_top).max(0.0))
+}
+
+/// True when the caret, or either end of a selection, sits on the source line
+/// that starts at `start`. The line's newline is not part of it, so a caret on
+/// the next line does not count.
+fn selection_touches_line(selection: Selection, text: &str, start: usize) -> bool {
+    let end = text[start..]
+        .find('\n')
+        .map_or(text.len(), |offset| start + offset);
+    if selection.is_caret() {
+        start <= selection.head && selection.head <= end
+    } else {
+        selection.start() <= end && start <= selection.end()
+    }
+}
+
+/// A block that renders as its own source while the caret is on the line that
+/// makes it: a rule, or a setext heading's underline. These constructs change
+/// the lines *around* them, so drawing them only after the caret leaves keeps
+/// the page still while they are being typed.
+fn live_source_view(block: &Block, source: &str, selection: Selection) -> bool {
+    match &block.kind {
+        BlockKind::Rule => selection_touches_line(selection, source, block.range.start),
+        BlockKind::Heading(_) => setext_underline(block)
+            .is_some_and(|underline| selection_touches_line(selection, source, underline.start)),
+        _ => false,
+    }
+}
+
+/// The underline line of a setext heading. ATX headings and closing hashes
+/// start at or before the content end, so only a setext underline sits past it.
+fn setext_underline(block: &Block) -> Option<Range<usize>> {
+    block
+        .prefix
+        .iter()
+        .find(|prefix| prefix.kind == PrefixKind::Heading && prefix.range.start > block.content.end)
+        .map(|prefix| prefix.range.clone())
+}
+
+/// True when the line ending right before `at` is empty; false at the very
+/// start of the document.
+pub(super) fn previous_line_is_blank(text: &str, at: usize) -> bool {
+    if at == 0 {
+        return false;
+    }
+    let end = at - 1;
+    let start = text[..end].rfind('\n').map_or(0, |offset| offset + 1);
+    text[start..end].trim().is_empty()
+}
+
+fn push_blank_line(
+    blocks: &mut Vec<LaidBlock>,
+    content_left: f32,
+    content_width: f32,
+    y: &mut f32,
+    blank: BlankLine,
+    spacer: Option<f32>,
+) {
+    let (kind, line_height, row_height) = match spacer {
+        Some(gap) => (LaidKind::Spacer, 18.0, gap),
+        None => (LaidKind::Blank, 29.5, 29.5),
+    };
+    let quote_indent = blank.quote_depth as f32 * 18.0;
+    blocks.push(LaidBlock {
+        block: None,
+        source_line: None,
+        kind,
+        rect: Rect::from_min_size(
+            Pos2::new(content_left, *y),
+            Vec2::new(content_width, row_height),
+        ),
+        text_pos: Pos2::new(content_left + quote_indent, *y),
+        text_width: (content_width - quote_indent).max(180.0),
+        line_height,
+        galley: None,
+        projection: Projection {
+            empty_source: blank.content,
+            ..Projection::default()
+        },
+        source_range: blank.content..blank.content,
+        quote_depth: blank.quote_depth,
+        list_marker: None,
+    });
+    *y += row_height;
+}
+
+fn spacing_for(block: &Block, previous: Option<&LaidBlock>, live_source: bool) -> (f32, f32) {
+    if live_source {
+        // Still typing it: keep the paragraph spacing the line had before the
+        // parser recognized the construct, so nothing jumps on that keystroke.
+        return paragraph_spacing(block, previous);
+    }
     let heading = block.heading_level();
-    let previous_heading =
-        previous.is_some_and(|p| matches!(p.kind, LaidKind::Text { heading: Some(_) }));
     match heading {
         Some(1) => (if previous.is_some() { 30.0 } else { 0.0 }, 14.0),
         Some(2) => (if previous.is_some() { 30.0 } else { 0.0 }, 10.0),
@@ -215,20 +481,27 @@ fn spacing_for(block: &Block, previous: Option<&LaidBlock>) -> (f32, f32) {
             BlockKind::CodeBlock(_) | BlockKind::Html => (12.0, 18.0),
             BlockKind::Table => (12.0, 18.0),
             BlockKind::Image(_) => (12.0, 18.0),
-            BlockKind::Rule => (18.0, 20.0),
+            // A rule always has a required blank line above it, which folds
+            // into spacing; its own margins stay small so the line does not
+            // read as a skipped empty row.
+            BlockKind::Rule => (9.0, 9.0),
             BlockKind::Heading(_) => (0.0, 0.0),
-            BlockKind::Paragraph => {
-                if block.quote_depth > 0 {
-                    (6.0, 9.0)
-                } else if block.list_marker.is_some() {
-                    (0.0, 3.0)
-                } else if previous_heading {
-                    (0.0, 10.0)
-                } else {
-                    (0.0, 9.0)
-                }
-            }
+            BlockKind::Paragraph => paragraph_spacing(block, previous),
         },
+    }
+}
+
+fn paragraph_spacing(block: &Block, previous: Option<&LaidBlock>) -> (f32, f32) {
+    let previous_heading =
+        previous.is_some_and(|p| matches!(p.kind, LaidKind::Text { heading: Some(_) }));
+    if block.quote_depth > 0 {
+        (6.0, 9.0)
+    } else if block.list_marker.is_some() {
+        (0.0, 3.0)
+    } else if previous_heading {
+        (0.0, 10.0)
+    } else {
+        (0.0, 9.0)
     }
 }
 
@@ -244,6 +517,7 @@ fn build_block(
     content_left: f32,
     content_width: f32,
     y: f32,
+    live_source: bool,
     code: &mut CodeHighlighter,
     images: &mut ImageCache,
 ) -> LaidBlock {
@@ -255,6 +529,21 @@ fn build_block(
 
     match &block.kind {
         BlockKind::Paragraph | BlockKind::Heading(_) => {
+            if live_source && let Some(underline) = setext_underline(block) {
+                return setext_source_block(
+                    block,
+                    block_index,
+                    source,
+                    theme,
+                    x,
+                    y,
+                    width,
+                    content_left,
+                    content_width,
+                    ctx,
+                    &underline,
+                );
+            }
             let (size, line_height) = text_metrics(block, theme);
             let projection = project(block, source, selection);
             let job = text_job(theme, block, &projection, size, line_height, width);
@@ -288,6 +577,20 @@ fn build_block(
             }
         }
         BlockKind::CodeBlock(info) => {
+            if info.fenced && code_raw_view(block, selection) {
+                return code_raw_block(
+                    block,
+                    block_index,
+                    source,
+                    theme,
+                    x,
+                    y,
+                    width,
+                    content_left,
+                    content_width,
+                    ctx,
+                );
+            }
             let display = source[block.content.clone()]
                 .trim_end_matches(['\n', '\r'])
                 .to_owned();
@@ -360,25 +663,44 @@ fn build_block(
                 list_marker: block.list_marker.clone(),
             }
         }
-        BlockKind::Rule => LaidBlock {
-            block: Some(block_index),
-            source_line: Some(block.line),
-            kind: LaidKind::Rule,
-            rect: Rect::from_min_size(Pos2::new(content_left, y), Vec2::new(content_width, 20.0)),
-            text_pos: Pos2::new(x, y),
-            text_width: width,
-            line_height: 20.0,
-            galley: None,
-            projection: Projection {
-                empty_source: block.content.start,
-                ..Projection::default()
-            },
-            source_range: block.content.clone(),
-            quote_depth: block.quote_depth,
-            list_marker: block.list_marker.clone(),
-        },
+        BlockKind::Rule => {
+            if live_source {
+                return rule_source_block(
+                    block,
+                    block_index,
+                    source,
+                    theme,
+                    x,
+                    y,
+                    width,
+                    content_left,
+                    content_width,
+                    ctx,
+                );
+            }
+            LaidBlock {
+                block: Some(block_index),
+                source_line: Some(block.line),
+                kind: LaidKind::Rule,
+                rect: Rect::from_min_size(
+                    Pos2::new(content_left, y),
+                    Vec2::new(content_width, 20.0),
+                ),
+                text_pos: Pos2::new(x, y),
+                text_width: width,
+                line_height: 20.0,
+                galley: None,
+                projection: Projection {
+                    empty_source: block.content.start,
+                    ..Projection::default()
+                },
+                source_range: block.content.clone(),
+                quote_depth: block.quote_depth,
+                list_marker: block.list_marker.clone(),
+            }
+        }
         BlockKind::Table => {
-            let editing = block.range.start < selection.head && selection.head <= block.range.end;
+            let editing = block.range.start <= selection.head && selection.head <= block.edit_end();
             if editing {
                 table_source_block(
                     block,
@@ -422,7 +744,7 @@ fn build_block(
             }
         }
         BlockKind::Image(_) => {
-            let editing = block.range.start < selection.head && selection.head <= block.range.end;
+            let editing = block.range.start <= selection.head && selection.head <= block.edit_end();
             if editing {
                 image_source_block(
                     block,
@@ -583,6 +905,240 @@ fn raw_projection(text: &str, source: Range<usize>) -> Projection {
     projection
 }
 
+/// Fenced code is edited as plain source while the caret is inside it (or
+/// while the fence is still unclosed), so typing the fence, its language and
+/// its body all look like text. The card is the preview for everywhere else.
+fn code_raw_view(block: &Block, selection: Selection) -> bool {
+    let fences = block
+        .prefix
+        .iter()
+        .filter(|p| p.kind == PrefixKind::Fence)
+        .count();
+    if fences < 2 {
+        return true;
+    }
+    block.range.start <= selection.head && selection.head <= block.edit_end()
+}
+
+/// The raw source of a fenced code block, laid out as plain monospace lines
+/// without a card so it reads as the surrounding text does while typing.
+#[allow(clippy::too_many_arguments)]
+fn code_raw_block(
+    block: &Block,
+    block_index: usize,
+    source: &str,
+    theme: &Theme,
+    x: f32,
+    y: f32,
+    width: f32,
+    content_left: f32,
+    content_width: f32,
+    ctx: &Context,
+) -> LaidBlock {
+    let display = source[block.range.clone()]
+        .trim_end_matches(['\n', '\r'])
+        .to_owned();
+    let mut job = LayoutJob {
+        wrap: TextWrapping::wrap_at_width(width),
+        break_on_newline: true,
+        keep_trailing_whitespace: true,
+        ..Default::default()
+    };
+    job.append(
+        &display,
+        0.0,
+        TextFormat {
+            font_id: theme.mono_font(15.0),
+            color: theme.text,
+            line_height: Some(23.0),
+            ..Default::default()
+        },
+    );
+    let galley = if display.is_empty() {
+        None
+    } else {
+        Some(ctx.fonts_mut(|fonts| fonts.layout_job(job)))
+    };
+    let height = galley.as_ref().map_or(23.0, |g| g.size().y.max(23.0));
+    LaidBlock {
+        block: Some(block_index),
+        source_line: Some(block.line),
+        kind: LaidKind::CodeSource,
+        rect: Rect::from_min_size(Pos2::new(content_left, y), Vec2::new(content_width, height)),
+        text_pos: Pos2::new(x, y),
+        text_width: width,
+        line_height: 23.0,
+        galley,
+        projection: raw_projection(
+            &display,
+            block.range.start..block.range.start + display.len(),
+        ),
+        source_range: block.range.start..block.range.start + display.len(),
+        quote_depth: block.quote_depth,
+        list_marker: None,
+    }
+}
+
+/// The rule line as the source that defines it, dimmed, while the caret is on
+/// it. Committing it draws the line itself.
+#[allow(clippy::too_many_arguments)]
+fn rule_source_block(
+    block: &Block,
+    block_index: usize,
+    source: &str,
+    theme: &Theme,
+    x: f32,
+    y: f32,
+    width: f32,
+    content_left: f32,
+    content_width: f32,
+    ctx: &Context,
+) -> LaidBlock {
+    let end = raw_source_end(block, source);
+    let display = &source[block.range.start..end];
+    let mut job = plain_source_job(width);
+    job.append(display, 0.0, plain_source_format(theme, theme.syntax));
+    let galley = if display.is_empty() {
+        None
+    } else {
+        Some(ctx.fonts_mut(|fonts| fonts.layout_job(job)))
+    };
+    let height = galley.as_ref().map_or(29.5, |g| g.size().y.max(29.5));
+    LaidBlock {
+        block: Some(block_index),
+        source_line: Some(block.line),
+        kind: LaidKind::Text { heading: None },
+        rect: Rect::from_min_size(Pos2::new(content_left, y), Vec2::new(content_width, height)),
+        text_pos: Pos2::new(x, y),
+        text_width: width,
+        line_height: 29.5,
+        galley,
+        projection: plain_source_projection(display, block.range.start..end),
+        source_range: block.range.start..end,
+        quote_depth: block.quote_depth,
+        list_marker: None,
+    }
+}
+
+/// A setext heading as its source: the paragraph lines as they were, then the
+/// dimmed underline. Only while the caret is on the underline line.
+#[allow(clippy::too_many_arguments)]
+fn setext_source_block(
+    block: &Block,
+    block_index: usize,
+    source: &str,
+    theme: &Theme,
+    x: f32,
+    y: f32,
+    width: f32,
+    content_left: f32,
+    content_width: f32,
+    ctx: &Context,
+    underline: &Range<usize>,
+) -> LaidBlock {
+    let end = raw_source_end(block, source);
+    let raw = &source[block.range.start..end];
+    let split = underline.start.clamp(block.range.start, end) - block.range.start;
+    let mut job = plain_source_job(width);
+    job.append(&raw[..split], 0.0, plain_source_format(theme, theme.text));
+    if split < raw.len() {
+        job.append(&raw[split..], 0.0, plain_source_format(theme, theme.syntax));
+    }
+    let galley = if raw.is_empty() {
+        None
+    } else {
+        Some(ctx.fonts_mut(|fonts| fonts.layout_job(job)))
+    };
+    let height = galley.as_ref().map_or(29.5, |g| g.size().y.max(29.5));
+    let mut projection = Projection {
+        text: raw.to_owned(),
+        empty_source: block.range.start,
+        ..Projection::default()
+    };
+    let body_chars = raw[..split].chars().count();
+    if split > 0 {
+        projection.segments.push(Segment {
+            display: 0..body_chars,
+            display_bytes: 0..split,
+            source: block.range.start..underline.start,
+            style: InlineStyle::default(),
+            kind: SegmentKind::Text,
+            atomic: false,
+        });
+    }
+    if split < raw.len() {
+        projection.segments.push(Segment {
+            display: body_chars..raw.chars().count(),
+            display_bytes: split..raw.len(),
+            source: underline.start..end,
+            style: InlineStyle {
+                syntax: true,
+                ..InlineStyle::default()
+            },
+            kind: SegmentKind::Syntax,
+            atomic: false,
+        });
+    }
+    LaidBlock {
+        block: Some(block_index),
+        source_line: Some(block.line),
+        kind: LaidKind::Text { heading: None },
+        rect: Rect::from_min_size(Pos2::new(content_left, y), Vec2::new(content_width, height)),
+        text_pos: Pos2::new(x, y),
+        text_width: width,
+        line_height: 29.5,
+        galley,
+        projection,
+        source_range: block.range.start..end,
+        quote_depth: block.quote_depth,
+        list_marker: None,
+    }
+}
+
+fn raw_source_end(block: &Block, source: &str) -> usize {
+    block.range.start
+        + source[block.range.clone()]
+            .trim_end_matches(['\n', '\r'])
+            .len()
+}
+
+fn plain_source_job(width: f32) -> LayoutJob {
+    LayoutJob {
+        wrap: TextWrapping::wrap_at_width(width),
+        break_on_newline: true,
+        keep_trailing_whitespace: true,
+        ..Default::default()
+    }
+}
+
+fn plain_source_format(theme: &Theme, color: Color32) -> TextFormat {
+    TextFormat {
+        font_id: theme.body_font(17.5),
+        color,
+        line_height: Some(29.5),
+        ..Default::default()
+    }
+}
+
+fn plain_source_projection(text: &str, source: Range<usize>) -> Projection {
+    let mut projection = Projection {
+        text: text.to_owned(),
+        empty_source: source.start,
+        ..Projection::default()
+    };
+    if !text.is_empty() {
+        projection.segments.push(Segment {
+            display: 0..text.chars().count(),
+            display_bytes: 0..text.len(),
+            source,
+            style: InlineStyle::default(),
+            kind: SegmentKind::Text,
+            atomic: false,
+        });
+    }
+    projection
+}
+
 #[allow(clippy::too_many_arguments)]
 fn table_source_block(
     block: &Block,
@@ -601,7 +1157,10 @@ fn table_source_block(
         .trim_end_matches(['\n', '\r'])
         .to_owned();
     let bg_width = width.max(220.0);
-    let job = code.job(&display, Some("markdown"), theme, bg_width - 40.0);
+    // No syntax highlighting here: syntect's markdown grammar costs ~9ms per
+    // rebuild (the whole card re-lays out on every caret move) and yields no
+    // visible colors for table source.
+    let job = code.job(&display, None, theme, bg_width - 40.0);
     let galley = if display.is_empty() {
         None
     } else {
@@ -954,5 +1513,520 @@ fn build_source(
         if start > source.len() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::paint;
+    use crate::theme::{Theme, ThemeKind};
+
+    #[test]
+    fn blank_lines_follow_source_lines() {
+        let starts =
+            |text: &str| -> Vec<usize> { blank_lines(text).iter().map(|b| b.start).collect() };
+        assert_eq!(starts("a\nb"), Vec::<usize>::new());
+        assert_eq!(starts("a\n\nb"), vec![2]);
+        assert_eq!(starts("a\n\n\nb"), vec![2, 3]);
+        assert_eq!(starts("a\n"), vec![2]);
+        assert_eq!(starts("a\n\n"), vec![2, 3]);
+        assert_eq!(starts("\n\n# h\n"), vec![0, 1, 6]);
+        assert_eq!(starts("a\r\n\r\nb"), vec![3]);
+        assert!(blank_lines("").is_empty());
+    }
+
+    #[test]
+    fn quote_only_lines_become_rows_after_their_markers() {
+        let blanks = blank_lines("> a\n> \n> >\n>\n");
+        assert_eq!(blanks.len(), 4, "three quoted lines plus the trailing one");
+        assert_eq!(blanks[0].content, 6, "caret goes after '> '");
+        assert_eq!(blanks[0].quote_depth, 1);
+        assert_eq!(blanks[1].content, 10);
+        assert_eq!(blanks[1].quote_depth, 2);
+        assert_eq!(blanks[2].content, 12);
+        assert_eq!(blanks[2].quote_depth, 1);
+        assert_eq!((blanks[3].start, blanks[3].quote_depth), (13, 0));
+        assert_eq!(
+            blank_lines("a\n> b\n")
+                .last()
+                .map(|b| (b.start, b.quote_depth)),
+            Some((6, 0)),
+            "the virtual line after a trailing newline stays plain"
+        );
+
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut doc = doc_with_selection("> a\n> \n> b\n", 6);
+        let mut engine = LayoutEngine::default();
+        let mut built = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+        });
+        output.textures_delta.clear();
+        let layout = built.expect("layout built");
+
+        let row = layout
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, LaidKind::Blank))
+            .expect("an empty quoted line gets a row");
+        assert_eq!(row.quote_depth, 1);
+        assert_eq!(row.source_range.start, 6);
+        assert!(
+            row.text_pos.x > layout.content_left,
+            "row is indented inside the quote"
+        );
+        assert_eq!(
+            layout.block_at_source_pos(6).map(|b| b.rect.top()),
+            Some(row.rect.top()),
+            "the caret sits on the quoted blank row"
+        );
+        let caret = paint::caret_rect_local(&layout, &doc);
+        assert_eq!(caret.map(|r| r.top()), Some(row.rect.top()));
+    }
+
+    #[test]
+    fn quote_markers_inside_code_are_not_blank_rows() {
+        let text = "```\n> \n```\n\nbelow\n";
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut doc = doc_with_selection(text, text.len() - 1);
+        let mut engine = LayoutEngine::default();
+        let mut built = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+        });
+        output.textures_delta.clear();
+        let layout = built.expect("layout built");
+        assert!(
+            !layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, LaidKind::Blank) && b.quote_depth > 0),
+            "'> ' inside a fence is code, not an empty quote line"
+        );
+    }
+
+    #[test]
+    fn the_blank_line_after_a_table_reads_as_spacing() {
+        let text = "| a | b |\n|---|---|\n| 1 | 2 |\n\nbelow\n";
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut doc = doc_with_selection(text, text.len() - 1);
+        let mut engine = LayoutEngine::default();
+        let mut built = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+        });
+        output.textures_delta.clear();
+        let layout = built.expect("layout built");
+
+        let table = layout
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, LaidKind::TableGrid { .. }))
+            .expect("table grid");
+        let spacer = layout
+            .blocks
+            .iter()
+            .find(|b| b.source_range.start == 30)
+            .expect("the separator line keeps a caret home");
+        assert!(matches!(spacer.kind, LaidKind::Spacer));
+        assert_eq!(spacer.rect.height(), 0.0, "no empty row under the table");
+        assert!(spacer.rect.top() > table.rect.bottom());
+        assert_eq!(
+            layout.block_at_source_pos(30).map(|b| b.rect.top()),
+            Some(spacer.rect.top()),
+            "the caret goes to the paragraph slot below the table"
+        );
+
+        let paragraph = layout
+            .blocks
+            .iter()
+            .find(|b| b.source_range.start == 31)
+            .expect("paragraph below");
+        assert!(
+            paragraph.rect.top() - table.rect.bottom() < 40.0,
+            "the gap below the table reads as spacing"
+        );
+    }
+
+    #[test]
+    fn the_blank_line_between_paragraphs_reads_as_spacing() {
+        let text = "a\n\nb\n";
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut doc = doc_with_selection(text, 0);
+        let mut engine = LayoutEngine::default();
+        let mut built = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+        });
+        output.textures_delta.clear();
+        let layout = built.expect("layout built");
+
+        let spacer = layout
+            .blocks
+            .iter()
+            .find(|b| b.source_range.start == 2)
+            .expect("the separator keeps a caret home");
+        assert!(matches!(spacer.kind, LaidKind::Spacer));
+        assert!(
+            !layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, LaidKind::Blank) && b.source_range.start == 2),
+            "no empty row between two paragraphs"
+        );
+        let first = layout
+            .blocks
+            .iter()
+            .find(|b| b.source_range.start == 0)
+            .expect("first paragraph");
+        let paragraph = layout
+            .blocks
+            .iter()
+            .find(|b| b.source_range.start == 3)
+            .expect("second paragraph");
+        let gap = paragraph.rect.top() - first.rect.bottom();
+        assert!(
+            (17.0..=19.0).contains(&gap),
+            "the paragraphs keep a readable gap, got {gap}"
+        );
+    }
+
+    #[test]
+    fn the_blank_line_before_a_rule_reads_as_spacing() {
+        let text = "16316\n\n---\n\nStart writing.\n";
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut doc = doc_with_selection(text, 5);
+        let mut engine = LayoutEngine::default();
+        let mut built = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+        });
+        output.textures_delta.clear();
+        let layout = built.expect("layout built");
+
+        let spacer = layout
+            .blocks
+            .iter()
+            .find(|b| b.source_range.start == 6)
+            .expect("the separator before the rule");
+        assert!(
+            matches!(spacer.kind, LaidKind::Spacer),
+            "the required blank line folds into spacing"
+        );
+        let paragraph = layout
+            .blocks
+            .iter()
+            .find(|b| b.source_range.start == 0)
+            .expect("the paragraph above the rule");
+        let rule = layout
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, LaidKind::Rule))
+            .expect("the rule");
+        let gap = rule.rect.top() - paragraph.rect.bottom();
+        assert!(
+            (17.0..=19.0).contains(&gap),
+            "the rule keeps ordinary block spacing, got {gap}"
+        );
+    }
+
+    #[test]
+    fn the_blank_line_under_the_caret_keeps_its_row() {
+        let text = "a\n\nb\n";
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut doc = doc_with_selection(text, 2);
+        let mut engine = LayoutEngine::default();
+        let mut built = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+        });
+        output.textures_delta.clear();
+        let layout = built.expect("layout built");
+
+        assert!(
+            layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, LaidKind::Blank) && b.source_range.start == 2),
+            "a blank line being edited keeps a full row"
+        );
+        assert!(
+            !layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, LaidKind::Spacer)),
+            "nothing collapses under the caret"
+        );
+        assert_eq!(
+            layout.block_at_source_pos(2).map(|b| b.source_range.start),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_rule_reads_as_source_while_the_caret_is_on_it() {
+        let text = "a\n\n---\n\nb\n";
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut engine = LayoutEngine::default();
+        let build = |engine: &mut LayoutEngine, doc: &mut Document| {
+            let mut built = None;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+                built = Some(engine.build(&ctx, doc, &theme, 900.0, 600.0));
+            });
+            output.textures_delta.clear();
+            built.expect("layout built")
+        };
+
+        let rule_start = text.find("---").unwrap();
+        let mut typing = doc_with_selection(text, rule_start + 1);
+        let layout = build(&mut engine, &mut typing);
+        let source = layout
+            .blocks
+            .iter()
+            .find(|b| b.source_range.start == rule_start)
+            .expect("the rule line");
+        assert!(
+            matches!(source.kind, LaidKind::Text { heading: None }),
+            "while the caret is on it the line is still the source"
+        );
+        assert_eq!(source.projection.text, "---");
+        assert!(
+            !layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, LaidKind::Rule)),
+            "the line itself is not drawn yet"
+        );
+
+        let mut committed = doc_with_selection(text, 0);
+        let layout = build(&mut engine, &mut committed);
+        assert!(
+            layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, LaidKind::Rule)),
+            "away from the line the rule renders"
+        );
+    }
+
+    #[test]
+    fn a_setext_underline_reads_as_source_while_the_caret_is_on_it() {
+        let text = "title\n---\n\nnext\n";
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut engine = LayoutEngine::default();
+        let build = |engine: &mut LayoutEngine, doc: &mut Document| {
+            let mut built = None;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+                built = Some(engine.build(&ctx, doc, &theme, 900.0, 600.0));
+            });
+            output.textures_delta.clear();
+            built.expect("layout built")
+        };
+
+        let underline = text.find("---").unwrap();
+        let mut typing = doc_with_selection(text, underline + 1);
+        let layout = build(&mut engine, &mut typing);
+        let source = layout
+            .blocks
+            .iter()
+            .find(|b| b.source_range.start == 0)
+            .expect("the heading line");
+        assert!(
+            matches!(source.kind, LaidKind::Text { heading: None }),
+            "the underline under the caret stays as text"
+        );
+        assert_eq!(source.projection.text, "title\n---");
+        assert!(
+            source
+                .projection
+                .segments
+                .iter()
+                .any(|s| s.style.syntax && s.source == (underline..underline + 3)),
+            "only the underline reads as syntax"
+        );
+
+        let mut committed = doc_with_selection(text, 0);
+        let layout = build(&mut engine, &mut committed);
+        let heading = layout
+            .blocks
+            .iter()
+            .find(|b| b.source_range.start == 0)
+            .expect("the heading");
+        assert!(
+            matches!(heading.kind, LaidKind::Text { heading: Some(2) }),
+            "away from the underline the setext heading commits"
+        );
+    }
+
+    #[test]
+    fn wysiwyg_keeps_blank_lines_and_their_caret() {
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut doc = Document::from_text("a\n\n\nb\n");
+        let mut engine = LayoutEngine::default();
+        let mut built = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+        });
+        output.textures_delta.clear();
+        let layout = built.expect("layout built");
+
+        let spacer = layout
+            .blocks
+            .iter()
+            .find(|b| b.source_range.start == 2)
+            .expect("the required separator keeps a caret home");
+        assert!(
+            matches!(spacer.kind, LaidKind::Spacer),
+            "the first blank line between two paragraphs reads as spacing"
+        );
+        let blanks: Vec<&LaidBlock> = layout
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.kind, LaidKind::Blank))
+            .collect();
+        assert_eq!(
+            blanks.len(),
+            2,
+            "the extra empty line and the trailing one keep their rows"
+        );
+        assert!(spacer.rect.top() < blanks[0].rect.top());
+        assert!(blanks[0].rect.top() < blanks[1].rect.top());
+        assert_eq!(blanks[0].source_range.start, 3);
+        assert_eq!(blanks[1].source_range.start, "a\n\n\nb\n".len());
+
+        let caret = paint::caret_rect_local(&layout, &doc_with_selection("a\n\n\nb\n", 3));
+        let blank = &blanks[0];
+        assert_eq!(caret.map(|r| r.top()), Some(blank.rect.top()));
+    }
+
+    fn doc_with_selection(text: &str, head: usize) -> Document {
+        let mut doc = Document::from_text(text);
+        doc.set_selection(Selection::caret(head));
+        doc
+    }
+
+    #[test]
+    fn fenced_code_edits_as_plain_source_and_previews_as_a_card() {
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut engine = LayoutEngine::default();
+        let text = "intro\n\n```rust\nfn main() {}\n```\n";
+        let build = |engine: &mut LayoutEngine, doc: &mut Document| {
+            let mut built = None;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+                built = Some(engine.build(&ctx, doc, &theme, 900.0, 600.0));
+            });
+            output.textures_delta.clear();
+            built.expect("layout built")
+        };
+
+        let mut typing = doc_with_selection(text, 10);
+        let layout = build(&mut engine, &mut typing);
+        let raw = layout
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, LaidKind::CodeSource))
+            .expect("raw fence lines");
+        assert_eq!(raw.source_range, 7..31);
+        assert_eq!(raw.projection.text, "```rust\nfn main() {}\n```");
+
+        let mut on_close = doc_with_selection(text, 29);
+        let layout = build(&mut engine, &mut on_close);
+        assert!(
+            layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, LaidKind::CodeSource))
+        );
+
+        let mut preview = doc_with_selection(text, 2);
+        let layout = build(&mut engine, &mut preview);
+        let card = layout
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, LaidKind::Code { .. }))
+            .expect("code card");
+        assert_eq!(card.source_range, 15..27);
+        assert!(matches!(
+            &card.kind,
+            LaidKind::Code { label, .. } if label == "RUST  ·  CODE"
+        ));
+
+        let mut unterminated = doc_with_selection("```", 3);
+        let layout = build(&mut engine, &mut unterminated);
+        assert!(
+            layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, LaidKind::CodeSource) && b.source_range == (0..3))
+        );
+    }
+
+    #[test]
+    fn source_views_stop_at_the_last_line_of_the_block() {
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut engine = LayoutEngine::default();
+        let build = |engine: &mut LayoutEngine, doc: &mut Document| {
+            let mut built = None;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+                built = Some(engine.build(&ctx, doc, &theme, 900.0, 600.0));
+            });
+            output.textures_delta.clear();
+            built.expect("layout built")
+        };
+
+        let text = "intro\n\n```rust\nfn main() {}\n```\nafter\n";
+        let mut below_fence = doc_with_selection(text, text.find("after").unwrap());
+        let layout = build(&mut engine, &mut below_fence);
+        assert!(
+            !layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, LaidKind::CodeSource)),
+            "the line after the closing fence is outside the block"
+        );
+        assert!(
+            layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, LaidKind::Code { .. }))
+        );
+
+        let table = "intro\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nbelow\n";
+        let mut below_table = doc_with_selection(table, table.find("below").unwrap());
+        let layout = build(&mut engine, &mut below_table);
+        assert!(
+            !layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, LaidKind::TableSource { .. })),
+            "the line after the table is outside the block"
+        );
+        assert!(
+            layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, LaidKind::TableGrid { .. }))
+        );
+
+        let mut inside_table = doc_with_selection(table, 8);
+        let layout = build(&mut engine, &mut inside_table);
+        assert!(
+            layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b.kind, LaidKind::TableSource { .. }))
+        );
     }
 }
