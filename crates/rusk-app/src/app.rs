@@ -1247,7 +1247,7 @@ impl eframe::App for RuskApp {
         }
 
         let body = ui.available_rect_before_wrap();
-        let footer_height = 24.0;
+        let footer_height = 18.0;
         let main_rect = egui::Rect::from_min_max(
             body.min,
             egui::Pos2::new(body.max.x, (body.max.y - footer_height).max(body.min.y)),
