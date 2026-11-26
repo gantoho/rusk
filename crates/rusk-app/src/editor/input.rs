@@ -408,8 +408,36 @@ fn move_horizontal(doc: &mut Document, left: bool, word: bool, extend: bool) {
     };
     if doc.mode() == rusk_core::ViewMode::Wysiwyg {
         target = clamp_to_visible_block(doc, head, target);
+        target = clamp_to_visible_inline_markers(doc, target, left);
     }
     doc.set_selection(select_to(doc, target, extend));
+}
+
+/// A hidden `**`, `*`, `` ` `` or link delimiter has no visual column of its
+/// own. Stepping into it would leave the caret on a byte the user cannot see
+/// and, worse, typing would split the marker. Jump across the whole delimiter
+/// instead: left goes before the opening marker, right goes after the closing
+/// one.
+fn clamp_to_visible_inline_markers(doc: &mut Document, target: usize, left: bool) -> usize {
+    let parsed = doc.parsed();
+    for block in &parsed.blocks {
+        if matches!(block.kind, BlockKind::CodeBlock(_) | BlockKind::Table) {
+            continue;
+        }
+        for marker in &block.markers {
+            if marker.range.start <= target
+                && target < marker.range.end
+                && marker.range.start < marker.range.end
+            {
+                return if left {
+                    marker.range.start
+                } else {
+                    marker.range.end
+                };
+            }
+        }
+    }
+    target
 }
 
 /// Keep horizontal caret movement out of hidden block syntax such as `# `,
@@ -2282,6 +2310,46 @@ mod tests {
         doc.set_selection(Selection::caret(8));
         assert!(delete_word(&mut doc, true));
         assert_eq!(doc.text(), "A  word");
+    }
+
+    #[test]
+    fn horizontal_arrows_skip_hidden_inline_markers() {
+        let mut doc = Document::from_text("A **bold** word");
+        doc.set_selection(Selection::caret(2));
+        move_horizontal(&mut doc, false, false, false);
+        assert_eq!(
+            doc.selection().head,
+            4,
+            "right enters the content, not `**`"
+        );
+
+        move_horizontal(&mut doc, true, false, false);
+        assert_eq!(
+            doc.selection().head,
+            2,
+            "left leaves before the opening `**`"
+        );
+
+        doc.set_selection(Selection::caret(8));
+        move_horizontal(&mut doc, false, false, false);
+        assert_eq!(
+            doc.selection().head,
+            10,
+            "right leaves after the closing `**`"
+        );
+
+        doc.set_selection(Selection::caret(10));
+        move_horizontal(&mut doc, true, false, false);
+        assert_eq!(doc.selection().head, 8, "left enters the content, not `**`");
+    }
+
+    #[test]
+    fn typing_after_skipping_the_opening_marker_stays_inside_bold() {
+        let mut doc = Document::from_text("A **bold** word");
+        doc.set_selection(Selection::caret(2));
+        move_horizontal(&mut doc, false, false, false);
+        assert!(doc.insert_text("X", EditKind::Insert));
+        assert_eq!(doc.text(), "A **Xbold** word");
     }
 
     #[test]
