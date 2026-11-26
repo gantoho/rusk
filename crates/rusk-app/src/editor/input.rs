@@ -2391,6 +2391,36 @@ mod tests {
     }
 
     #[test]
+    fn hit_testing_the_tail_of_italic_enters_its_content() {
+        use crate::editor::layout::LayoutEngine;
+        use crate::theme::{Theme, ThemeKind};
+        let ctx = egui::Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut engine = LayoutEngine::default();
+        let text = "A *italic* word";
+        let mut doc = Document::from_text(text);
+        let mut layout = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            layout = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None));
+        });
+        output.textures_delta.clear();
+        let layout = layout.expect("layout");
+        let block = layout.blocks.first().expect("block");
+        let display_end = block.projection.source_to_display(10, true);
+        let p = block
+            .galley
+            .as_ref()
+            .expect("galley")
+            .pos_from_cursor(egui::text::CCursor::new(display_end));
+        let target = egui::Pos2::new(
+            block.text_pos.x + p.left() + 1.0,
+            block.text_pos.y + p.center().y,
+        );
+        let head = hit_test_local(&mut doc, &layout, target);
+        assert_eq!(head, 9, "the visual tail snaps to the text, not after `*`");
+    }
+
+    #[test]
     fn formatting_does_not_span_paragraphs() {
         let mut doc = Document::from_text("one\n\ntwo");
         doc.set_selection(Selection::new(0, 8));
