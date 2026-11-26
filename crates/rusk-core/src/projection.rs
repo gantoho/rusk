@@ -233,9 +233,9 @@ pub fn project(block: &Block, source: &str, reveal: Selection) -> Projection {
     // Headings reveal their hashes while the caret is in the heading.
     let heading_touched = block.heading_level().is_some()
         && if reveal.is_caret() {
-            block.content.start < reveal.head && reveal.head <= block.content.end
+            block.range.start <= reveal.head && reveal.head <= block.range.end
         } else {
-            reveal.start() < block.content.end && block.content.start < reveal.end()
+            reveal.start() <= block.range.end && block.range.start <= reveal.end()
         };
     if heading_touched {
         for prefix in &block.prefix {
@@ -384,12 +384,29 @@ mod tests {
     }
 
     #[test]
-    fn heading_marker_is_hidden_at_content_start() {
+    fn heading_marker_reveals_at_content_start() {
         let md = "# Title";
         let doc = parse(md);
         let p = project(&doc.blocks[0], md, Selection::caret(2));
-        assert_eq!(p.text, "Title");
-        assert_eq!(p.display_to_source(0), 2);
+        assert_eq!(p.text, "# Title");
+    }
+
+    #[test]
+    fn heading_marker_reveals_at_its_block_boundaries() {
+        let md = "# Title";
+        let doc = parse(md);
+        for head in [0, 7] {
+            let p = project(&doc.blocks[0], md, Selection::caret(head));
+            assert_eq!(p.text, "# Title", "boundary {head}");
+        }
+    }
+
+    #[test]
+    fn heading_marker_reveals_at_content_end() {
+        let md = "# Title";
+        let doc = parse(md);
+        let p = project(&doc.blocks[0], md, Selection::caret(7));
+        assert_eq!(p.text, "# Title");
     }
 
     #[test]
