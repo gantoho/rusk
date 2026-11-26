@@ -24,12 +24,14 @@ pub struct Editor {
     ime_preedit: String,
     pub last_ime_rect: Option<Rect>,
     vertical_goal_x: Option<f32>,
+    pending_language_edit: Option<std::ops::Range<usize>>,
 }
 
 #[derive(Default)]
 pub struct EditorOutcome {
     pub changed: bool,
     pub open_url: Option<String>,
+    pub language_edit: Option<std::ops::Range<usize>>,
 }
 
 impl Editor {
@@ -48,6 +50,7 @@ impl Editor {
             ime_preedit: String::new(),
             last_ime_rect: None,
             vertical_goal_x: None,
+            pending_language_edit: None,
         }
     }
 
@@ -58,6 +61,7 @@ impl Editor {
         self.ime_preedit.clear();
         self.focus_requested = true;
         self.vertical_goal_x = None;
+        self.pending_language_edit = None;
     }
 
     pub fn request_focus(&mut self) {
@@ -152,6 +156,9 @@ impl Editor {
                         self.handle_pointer(ui, &response, &layout, doc, origin, focused)
                     {
                         outcome.open_url = Some(open_url);
+                    }
+                    if let Some(range) = self.pending_language_edit.take() {
+                        outcome.language_edit = Some(range);
                     }
                     if focused {
                         let changed = self.handle_keyboard(ui, &layout, doc, origin);

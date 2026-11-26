@@ -29,7 +29,8 @@ impl super::Editor {
 
         if response.hovered() {
             let link = link_at(doc, target);
-            if link.is_some() && ui.input(|i| i.modifiers.command) {
+            let over_language = code_language_at(layout, local).is_some();
+            if over_language || (link.is_some() && ui.input(|i| i.modifiers.command)) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             } else {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
@@ -45,6 +46,10 @@ impl super::Editor {
 
         if primary_pressed && response.hovered() {
             ui.memory_mut(|memory| memory.request_focus(self.focus_id()));
+            if let Some(range) = code_language_at(layout, local) {
+                self.pending_language_edit = Some(range);
+                return None;
+            }
             if ui.input(|i| i.modifiers.command)
                 && let Some(url) = link_at(doc, target)
             {
@@ -1104,6 +1109,41 @@ fn move_vertical_by(
     }
     let head = doc.selection().head;
     let len = doc.len_bytes();
+    if let Some(index) = block_index_at(layout, head)
+        && let LaidKind::TableGrid { grid } = &layout.blocks[index].kind
+        && let Some(cell) = grid
+            .cells
+            .iter()
+            .find(|cell| cell.source.start <= head && head <= cell.source.end)
+    {
+        let row = if delta < 0.0 {
+            cell.row.checked_sub(1)
+        } else {
+            Some(cell.row + 1)
+        };
+        if let Some(row) = row
+            && let Some(next) = grid
+                .cells
+                .iter()
+                .find(|candidate| candidate.row == row && candidate.col == cell.col)
+        {
+            doc.set_selection(select_to(doc, next.source.start, extend));
+            return;
+        }
+        let pos = if delta < 0.0 {
+            layout.blocks[..index].last().map_or(0, |prev| {
+                let text = doc.text();
+                trim_trailing_newline(&text, prev.source_range.end)
+            })
+        } else {
+            layout
+                .blocks
+                .get(index + 1)
+                .map_or(len, |next| next.source_range.start)
+        };
+        doc.set_selection(select_to(doc, pos, extend));
+        return;
+    }
     let mut pos = if delta < 0.0 && caret.top() < 4.0 {
         0
     } else {
@@ -1159,6 +1199,15 @@ fn block_index_at(layout: &DocumentLayout, pos: usize) -> Option<usize> {
     layout
         .block_at_source_pos(pos)
         .and_then(|block| layout.blocks.iter().position(|b| std::ptr::eq(b, block)))
+}
+
+fn trim_trailing_newline(text: &str, end: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut end = end.min(bytes.len());
+    while end > 0 && matches!(bytes[end - 1], b'\n' | b'\r') {
+        end -= 1;
+    }
+    end
 }
 
 fn neighbour_pos(layout: &DocumentLayout, len: usize, index: usize, delta: f32) -> usize {
@@ -1913,6 +1962,17 @@ fn link_destination_at(doc: &mut Document, selection: Selection) -> Option<Range
     None
 }
 
+fn code_language_at(layout: &DocumentLayout, local: Pos2) -> Option<Range<usize>> {
+    layout.blocks.iter().find_map(|block| match &block.kind {
+        LaidKind::Code {
+            label_rect,
+            language_range: Some(range),
+            ..
+        } if label_rect.contains(local) => Some(range.clone()),
+        _ => None,
+    })
+}
+
 /// A click or vertical move that lands on the visual edge of formatted text
 /// should enter the editable span, not sit just outside the hidden marker.
 /// The marker bytes remain reachable by clicking the revealed syntax or by
@@ -2003,7 +2063,17 @@ fn hit_test_local(doc: &mut Document, layout: &DocumentLayout, local: Pos2) -> u
         LaidKind::TableGrid { grid } => {
             for cell in &grid.cells {
                 if cell.rect.contains(local) {
-                    return cell.source.start;
+                    let Some(galley) = &cell.galley else {
+                        return cell.source.start;
+                    };
+                    let local_text = (local - cell.text_origin.to_vec2()).to_vec2();
+                    let index = galley.cursor_from_pos(local_text).index.0;
+                    let byte = cell
+                        .text
+                        .char_indices()
+                        .nth(index)
+                        .map_or(cell.text.len(), |(byte, _)| byte);
+                    return (cell.source.start + byte).min(cell.source.end);
                 }
             }
             block.source_range.start
@@ -2480,8 +2550,8 @@ a
             move_once(ui, &layout, &mut doc, 1.0, false);
         });
         output.textures_delta.clear();
-        // The closing fence is its own source line under the caret.
-        assert_eq!(doc.selection().head, 6);
+        // The card behaves as one block while editing; Down leaves it for `a`.
+        assert_eq!(doc.selection().head, 11);
     }
 
     #[test]
@@ -2505,7 +2575,7 @@ a
             move_once(ui, &layout, &mut doc, -1.0, false);
         });
         output.textures_delta.clear();
-        assert_eq!(doc.selection().head, 1);
+        assert_eq!(doc.selection().head, 0);
     }
 
     #[test]
@@ -2536,6 +2606,42 @@ a
     }
 
     #[test]
+    fn table_cells_hit_test_and_show_a_caret_inline() {
+        use crate::editor::layout::{LaidKind, LayoutEngine};
+        use crate::theme::{Theme, ThemeKind};
+        let ctx = egui::Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut doc = Document::from_text("| h |\n|---|\n| 1 |\n");
+        let mut engine = LayoutEngine::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
+            let (rect, origin, source) = layout
+                .blocks
+                .iter()
+                .find_map(|block| match &block.kind {
+                    LaidKind::TableGrid { grid } => grid
+                        .cells
+                        .first()
+                        .map(|cell| (cell.rect, cell.text_origin, cell.source.clone())),
+                    _ => None,
+                })
+                .expect("table cell");
+            let head = hit_test_local(&mut doc, &layout, origin + egui::Vec2::new(4.0, 0.0));
+            assert!(
+                source.start <= head && head <= source.end,
+                "cell hit must map inside the cell source"
+            );
+            doc.set_selection(Selection::caret(head));
+            let caret = paint::caret_rect_local(&layout, &doc).expect("cell caret");
+            assert!(
+                rect.contains(caret.center()),
+                "caret must be painted inside the cell"
+            );
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
     fn arrow_down_leaves_the_last_row_of_a_table_card() {
         use crate::editor::layout::LayoutEngine;
         use crate::theme::{Theme, ThemeKind};
@@ -2556,7 +2662,7 @@ a
             move_once(ui, &layout, &mut doc, 1.0, false);
         });
         output.textures_delta.clear();
-        assert_eq!(doc.selection().head, 21);
+        assert_eq!(doc.selection().head, 17);
     }
 
     #[test]

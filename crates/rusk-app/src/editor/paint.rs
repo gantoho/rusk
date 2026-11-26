@@ -190,28 +190,40 @@ fn paint_selection(
     if display.is_empty() {
         return;
     }
-    let mut row_start = 0usize;
-    for row in &galley.rows {
-        let count = row.char_count_excluding_newline().0;
-        let row_end = row_start + count;
-        let start = display.start.max(row_start);
-        let end = display.end.min(row_end);
-        if start < end {
-            let p1 = galley.pos_from_cursor(egui::text::CCursor::new(start));
-            let p2 = galley.pos_from_cursor(egui::text::CCursor::new(end));
-            let rect = Rect::from_min_max(
-                Pos2::new(
-                    block.text_pos.x + p1.left() + shift.x,
-                    block.text_pos.y + row.min_y() + shift.y,
-                ),
-                Pos2::new(
-                    block.text_pos.x + p2.left() + shift.x,
-                    block.text_pos.y + row.max_y() + shift.y,
-                ),
-            );
-            painter.rect_filled(rect, 2.0, theme.selection);
+    let start_cursor = galley.layout_from_cursor(egui::text::CCursor::new(display.start));
+    let end_cursor = galley.layout_from_cursor(egui::text::CCursor::new(display.end));
+    for (row_index, row) in galley.rows.iter().enumerate() {
+        if row_index < start_cursor.row || row_index > end_cursor.row {
+            continue;
         }
-        row_start += row.char_count_including_newline().0;
+        let columns = row.char_count_excluding_newline().0;
+        let start_column = if row_index == start_cursor.row {
+            start_cursor.column.0
+        } else {
+            0
+        };
+        let end_column = if row_index == end_cursor.row {
+            end_cursor.column.0
+        } else {
+            columns
+        }
+        .min(columns);
+        if start_column >= end_column {
+            continue;
+        }
+        let x1 = row.x_offset(egui::text::CharIndex(start_column));
+        let x2 = row.x_offset(egui::text::CharIndex(end_column));
+        let rect = Rect::from_min_max(
+            Pos2::new(
+                block.text_pos.x + x1 + shift.x,
+                block.text_pos.y + row.min_y() + shift.y,
+            ),
+            Pos2::new(
+                block.text_pos.x + x2 + shift.x,
+                block.text_pos.y + row.max_y() + shift.y,
+            ),
+        );
+        painter.rect_filled(rect, 2.0, theme.selection);
     }
 }
 
@@ -455,6 +467,10 @@ fn paint_table_text(painter: &Painter, grid: &TableGrid, theme: &Theme, shift: V
         let rect = cell.rect.translate(shift);
         let clip = rect.shrink2(Vec2::new(9.0, 3.0));
         let p = painter.with_clip_rect(clip);
+        if let Some(galley) = &cell.galley {
+            p.galley(cell.text_origin + shift, galley.clone(), theme.text);
+            continue;
+        }
         let (anchor_x, align) = match cell.align {
             egui::Align::Center => (rect.center().x, Align2::CENTER_CENTER),
             egui::Align::Max => (rect.right() - 10.0, Align2::RIGHT_CENTER),
@@ -586,6 +602,25 @@ pub fn caret_rect_local(layout: &DocumentLayout, doc: &Document) -> Option<Rect>
         Some(block) => block,
         None => layout.blocks.first().unwrap(),
     };
+    if let LaidKind::TableGrid { grid } = &block.kind {
+        for cell in &grid.cells {
+            if cell.source.start <= head && head <= cell.source.end {
+                let Some(galley) = &cell.galley else {
+                    break;
+                };
+                let byte = head.saturating_sub(cell.source.start).min(cell.text.len());
+                let index = cell.text[..byte].chars().count();
+                let cursor = galley.pos_from_cursor(egui::text::CCursor::new(index));
+                return Some(Rect::from_min_size(
+                    Pos2::new(
+                        cell.text_origin.x + cursor.left(),
+                        cell.text_origin.y + cursor.top(),
+                    ),
+                    Vec2::new(2.0, cursor.height().max(cell.rect.height() * 0.55)),
+                ));
+            }
+        }
+    }
     let display = block.projection.source_to_display(head, true);
     if let Some(galley) = &block.galley {
         let cursor = galley.pos_from_cursor(egui::text::CCursor::new(display));

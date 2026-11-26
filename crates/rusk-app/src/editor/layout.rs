@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use eframe::egui::epaint::text::{LayoutJob, TextWrapping};
 use eframe::egui::{
-    self, Color32, Context, FontFamily, FontId, Pos2, Rect, Stroke, TextFormat, Vec2,
+    self, Color32, Context, FontFamily, FontId, Galley, Pos2, Rect, Stroke, TextFormat, Vec2,
 };
 use rusk_core::markdown::{Block, BlockKind, InlineStyle, ListMarker, PrefixKind, TableData};
 use rusk_core::projection::{Projection, Segment, SegmentKind, project};
@@ -101,6 +101,8 @@ pub enum LaidKind {
     Code {
         bg: Rect,
         label: String,
+        label_rect: Rect,
+        language_range: Option<Range<usize>>,
     },
     /// A fenced code block edited as plain source lines, fences included.
     CodeSource,
@@ -139,11 +141,14 @@ pub struct TableGrid {
 #[derive(Clone, Debug)]
 pub struct TableCellRect {
     pub row: usize,
+    pub col: usize,
     pub rect: Rect,
     pub source: Range<usize>,
     pub header: bool,
     pub text: String,
     pub align: egui::Align,
+    pub galley: Option<Arc<Galley>>,
+    pub text_origin: Pos2,
 }
 
 #[derive(Clone, Debug)]
@@ -213,7 +218,11 @@ impl LaidBlock {
         self.rect = self.rect.translate(offset);
         self.text_pos.y += dy;
         match &mut self.kind {
-            LaidKind::Code { bg, .. } | LaidKind::TableSource { bg } => {
+            LaidKind::Code { bg, label_rect, .. } => {
+                *bg = bg.translate(offset);
+                *label_rect = label_rect.translate(offset);
+            }
+            LaidKind::TableSource { bg } => {
                 *bg = bg.translate(offset);
             }
             LaidKind::TableGrid { grid } => {
@@ -869,12 +878,50 @@ fn build_block(
             let bg_height = 38.0 + body_height + 16.0;
             let bg = Rect::from_min_size(Pos2::new(x, y), Vec2::new(bg_width, bg_height.max(62.0)));
             let source_end = block.content.start + display.len();
+            let language_range = info
+                .language
+                .as_ref()
+                .and_then(|language| {
+                    block
+                        .prefix
+                        .iter()
+                        .find(|prefix| prefix.kind == PrefixKind::Fence)
+                        .and_then(|prefix| {
+                            let raw = &source[prefix.range.clone()];
+                            raw.find(language).map(|offset| {
+                                let start = prefix.range.start + offset;
+                                start..start + language.len()
+                            })
+                        })
+                })
+                .or_else(|| {
+                    block
+                        .prefix
+                        .iter()
+                        .find(|prefix| prefix.kind == PrefixKind::Fence)
+                        .map(|prefix| {
+                            let raw = &source[prefix.range.clone()];
+                            let indent = raw.len() - raw.trim_start_matches(' ').len();
+                            let fence = raw[indent..]
+                                .chars()
+                                .take_while(|ch| *ch == '`' || *ch == '~')
+                                .count();
+                            let start = prefix.range.start + indent + fence;
+                            start..start
+                        })
+                });
+            let label_rect = Rect::from_min_size(
+                Pos2::new(bg.left() + 26.0, bg.top() + 6.0),
+                Vec2::new((bg_width - 44.0).max(40.0), 18.0),
+            );
             LaidBlock {
                 block: Some(block_index),
                 source_line: Some(block.line),
                 kind: LaidKind::Code {
                     bg,
                     label: format!("{}  ·  CODE", language.to_uppercase()),
+                    label_rect,
+                    language_range,
                 },
                 rect: Rect::from_min_size(
                     Pos2::new(content_left, y),
@@ -911,6 +958,8 @@ fn build_block(
                 kind: LaidKind::Code {
                     bg,
                     label: "HTML  ·  BLOCK".to_owned(),
+                    label_rect: Rect::NOTHING,
+                    language_range: None,
                 },
                 rect: Rect::from_min_size(
                     Pos2::new(content_left, y),
@@ -963,22 +1012,7 @@ fn build_block(
             }
         }
         BlockKind::Table => {
-            let editing = block.range.start <= selection.head && selection.head <= block.edit_end();
-            if editing {
-                table_source_block(
-                    block,
-                    block_index,
-                    source,
-                    theme,
-                    x,
-                    y,
-                    width,
-                    content_left,
-                    content_width,
-                    ctx,
-                    code,
-                )
-            } else if let Some(table) = &block.table {
+            if let Some(table) = &block.table {
                 table_grid(
                     block,
                     block_index,
@@ -989,6 +1023,7 @@ fn build_block(
                     width,
                     content_left,
                     content_width,
+                    ctx,
                 )
             } else {
                 table_source_block(
@@ -1170,19 +1205,16 @@ fn raw_projection(text: &str, source: Range<usize>) -> Projection {
     projection
 }
 
-/// Fenced code is edited as plain source while the caret is inside it (or
-/// while the fence is still unclosed), so typing the fence, its language and
-/// its body all look like text. The card is the preview for everywhere else.
-fn code_raw_view(block: &Block, selection: Selection) -> bool {
-    let fences = block
+/// An unclosed fence is still being typed, so it is shown as source. A closed
+/// fenced block stays a card while the caret is inside it: the body is directly
+/// editable there, and only the unclosed/opening fence is source territory.
+fn code_raw_view(block: &Block, _selection: Selection) -> bool {
+    block
         .prefix
         .iter()
         .filter(|p| p.kind == PrefixKind::Fence)
-        .count();
-    if fences < 2 {
-        return true;
-    }
-    block.range.start <= selection.head && selection.head <= block.edit_end()
+        .count()
+        < 2
 }
 
 /// The raw source of a fenced code block, laid out as plain monospace lines
@@ -1467,6 +1499,7 @@ fn table_grid(
     width: f32,
     content_left: f32,
     content_width: f32,
+    ctx: &Context,
 ) -> LaidBlock {
     let columns = table
         .rows
@@ -1506,25 +1539,59 @@ fn table_grid(
                 (block.content.start..block.content.start, String::new()),
                 |c| (c.range.clone(), c.text.clone()),
             );
+            let align = table
+                .alignments
+                .get(col)
+                .copied()
+                .map_or(egui::Align::Min, |a| match a {
+                    pulldown_cmark::Alignment::Center => egui::Align::Center,
+                    pulldown_cmark::Alignment::Right => egui::Align::Max,
+                    _ => egui::Align::Min,
+                });
+            let font = if row.header {
+                theme.bold_font(13.5)
+            } else {
+                theme.body_font(14.0)
+            };
+            let mut job = LayoutJob::default();
+            job.wrap.max_width = (rect.width() - 20.0).max(10.0);
+            job.append(
+                &text,
+                0.0,
+                TextFormat {
+                    font_id: font,
+                    color: theme.text,
+                    ..Default::default()
+                },
+            );
+            let galley = if text.is_empty() {
+                None
+            } else {
+                Some(ctx.fonts_mut(|fonts| fonts.layout_job(job)))
+            };
+            let text_origin = if let Some(galley) = &galley {
+                let x = match align {
+                    egui::Align::Center => rect.center().x - galley.size().x * 0.5,
+                    egui::Align::Max => rect.right() - 10.0 - galley.size().x,
+                    _ => rect.left() + 10.0,
+                };
+                Pos2::new(x, rect.center().y - galley.size().y * 0.5)
+            } else {
+                Pos2::new(rect.left() + 10.0, rect.center().y)
+            };
             cells.push(TableCellRect {
                 row: row_index,
+                col,
                 rect,
                 source,
                 header: row.header,
                 text,
-                align: table
-                    .alignments
-                    .get(col)
-                    .copied()
-                    .map_or(egui::Align::Min, |a| match a {
-                        pulldown_cmark::Alignment::Center => egui::Align::Center,
-                        pulldown_cmark::Alignment::Right => egui::Align::Max,
-                        _ => egui::Align::Min,
-                    }),
+                align,
+                galley,
+                text_origin,
             });
         }
     }
-    let _ = theme;
     LaidBlock {
         block: Some(block_index),
         source_line: Some(block.line),
@@ -1594,6 +1661,8 @@ fn image_source_block(
         kind: LaidKind::Code {
             bg,
             label: "IMAGE  ·  SOURCE".to_owned(),
+            label_rect: Rect::NOTHING,
+            language_range: None,
         },
         rect: Rect::from_min_size(
             Pos2::new(content_left, y),
@@ -2182,7 +2251,7 @@ mod tests {
     }
 
     #[test]
-    fn fenced_code_edits_as_plain_source_and_previews_as_a_card() {
+    fn fenced_code_edits_as_a_card_and_unclosed_fences_stay_source() {
         let ctx = Context::default();
         let theme = Theme::new(ThemeKind::Paper);
         let mut engine = LayoutEngine::default();
@@ -2198,13 +2267,12 @@ mod tests {
 
         let mut typing = doc_with_selection(text, 10);
         let layout = build(&mut engine, &mut typing);
-        let raw = layout
+        let card = layout
             .blocks
             .iter()
-            .find(|b| matches!(b.kind, LaidKind::CodeSource))
-            .expect("raw fence lines");
-        assert_eq!(raw.source_range, 7..31);
-        assert_eq!(raw.projection.text, "```rust\nfn main() {}\n```");
+            .find(|b| matches!(b.kind, LaidKind::Code { .. }))
+            .expect("code card while typing");
+        assert_eq!(card.source_range, 15..27);
 
         let mut on_close = doc_with_selection(text, 29);
         let layout = build(&mut engine, &mut on_close);
@@ -2212,7 +2280,8 @@ mod tests {
             layout
                 .blocks
                 .iter()
-                .any(|b| matches!(b.kind, LaidKind::CodeSource))
+                .any(|b| matches!(b.kind, LaidKind::Code { .. })),
+            "closed fence stays a card"
         );
 
         let mut preview = doc_with_selection(text, 2);
@@ -2227,6 +2296,15 @@ mod tests {
             &card.kind,
             LaidKind::Code { label, .. } if label == "RUST  ·  CODE"
         ));
+        if let LaidKind::Code {
+            language_range: Some(range),
+            ..
+        } = &card.kind
+        {
+            assert_eq!(&text[range.clone()], "rust");
+        } else {
+            panic!("code card must expose its language range");
+        }
 
         let mut unterminated = doc_with_selection("```", 3);
         let layout = build(&mut engine, &mut unterminated);
@@ -2292,7 +2370,7 @@ mod tests {
             layout
                 .blocks
                 .iter()
-                .any(|b| matches!(b.kind, LaidKind::TableSource { .. }))
+                .any(|b| matches!(b.kind, LaidKind::TableGrid { .. }))
         );
     }
 

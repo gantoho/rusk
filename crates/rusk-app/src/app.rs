@@ -27,6 +27,11 @@ enum Modal {
     About,
     Shortcuts,
     Error(String),
+    Language {
+        range: std::ops::Range<usize>,
+        text: String,
+        focus: bool,
+    },
 }
 
 struct Toast {
@@ -1131,6 +1136,67 @@ impl RuskApp {
                         }
                     });
             }
+            Modal::Language {
+                range,
+                mut text,
+                mut focus,
+            } => {
+                let theme = self.theme;
+                let mut save = false;
+                let mut cancel = false;
+                egui::Window::new("Code language")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .default_width(360.0)
+                    .show(ctx, |ui| {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("Fence language or info string")
+                                .size(12.5)
+                                .color(theme.muted),
+                        );
+                        ui.add_space(6.0);
+                        let enter = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+                        let escape = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+                        let id = ui.make_persistent_id("rusk-code-language-input");
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut text)
+                                .id(id)
+                                .hint_text("rust")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if focus {
+                            response.request_focus();
+                            focus = false;
+                        }
+                        if enter {
+                            save = true;
+                        }
+                        if escape {
+                            cancel = true;
+                        }
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked() {
+                                save = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if save {
+                    self.doc.replace_range(range, &text, EditKind::Replace);
+                    self.modal = Modal::None;
+                    self.editor.request_focus();
+                } else if cancel {
+                    self.modal = Modal::None;
+                    self.editor.request_focus();
+                } else {
+                    self.modal = Modal::Language { range, text, focus };
+                }
+            }
             Modal::Error(message) => {
                 egui::Window::new("Something went wrong")
                     .collapsible(false)
@@ -1284,6 +1350,14 @@ impl eframe::App for RuskApp {
                             && let Err(err) = open::that_detached(&url)
                         {
                             self.set_toast(format!("Could not open link: {err}"), true);
+                        }
+                        if let Some(range) = outcome.language_edit {
+                            let text = self.doc.text()[range.clone()].to_owned();
+                            self.modal = Modal::Language {
+                                range,
+                                text,
+                                focus: true,
+                            };
                         }
                     });
             },
