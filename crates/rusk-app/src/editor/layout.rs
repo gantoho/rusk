@@ -1105,7 +1105,9 @@ fn format_for(
     if style.code || matches!(kind, SegmentKind::Code) {
         font = theme.mono_font((size * 0.88).max(12.0));
         color = theme.inline_code;
-        background = theme.code_bg;
+        // Inline code chips are painted as rounded rectangles in paint.rs;
+        // egui's TextFormat background is a hard rectangle with no padding.
+        background = Color32::TRANSPARENT;
         line = line_height;
     }
     if style.math {

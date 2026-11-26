@@ -46,6 +46,7 @@ pub fn paint(
     // Backgrounds first.
     for block in &layout.blocks {
         paint_block_background(ui, painter, block, theme, shift);
+        paint_inline_code_chips(painter, block, theme, shift);
         paint_quote_bars(painter, block, theme, shift);
     }
 
@@ -211,6 +212,55 @@ fn paint_selection(
             painter.rect_filled(rect, 2.0, theme.selection);
         }
         row_start += row.char_count_including_newline().0;
+    }
+}
+
+fn paint_inline_code_chips(painter: &Painter, block: &LaidBlock, theme: &Theme, shift: Vec2) {
+    if !matches!(block.kind, LaidKind::Text { .. }) {
+        return;
+    }
+    let Some(galley) = &block.galley else {
+        return;
+    };
+    let total_chars = galley.job.text.chars().count();
+    for segment in &block.projection.segments {
+        if !segment.style.code {
+            continue;
+        }
+        let start = segment.display.start.min(total_chars);
+        let end = segment.display.end.min(total_chars);
+        if start >= end {
+            continue;
+        }
+        let mut row_start = 0usize;
+        for row in &galley.rows {
+            let count = row.char_count_excluding_newline().0;
+            let row_end = row_start + count;
+            let from = start.max(row_start);
+            let to = end.min(row_end);
+            if from < to {
+                let p1 = galley.pos_from_cursor(egui::text::CCursor::new(from));
+                let p2 = galley.pos_from_cursor(egui::text::CCursor::new(to));
+                let rect = Rect::from_min_max(
+                    Pos2::new(
+                        block.text_pos.x + p1.left() - 3.0 + shift.x,
+                        block.text_pos.y + row.min_y() + 2.0 + shift.y,
+                    ),
+                    Pos2::new(
+                        block.text_pos.x + p2.left() + 3.0 + shift.x,
+                        block.text_pos.y + row.max_y() - 2.0 + shift.y,
+                    ),
+                );
+                painter.rect(
+                    rect,
+                    3.5,
+                    theme.code_bg,
+                    Stroke::new(1.0, theme.code_border),
+                    StrokeKind::Inside,
+                );
+            }
+            row_start += row.char_count_including_newline().0;
+        }
     }
 }
 
