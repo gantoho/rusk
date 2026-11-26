@@ -151,8 +151,8 @@ fn char_to_byte(text: &str, char_index: usize) -> usize {
 }
 
 /// Reveal syntax when the caret/selection is *inside* the construct, not when
-/// it merely touches an outer boundary. This is what keeps a link's syntax
-/// hidden when the caret sits just before it.
+/// it merely touches the far outer boundary. Callers may opt into revealing at
+/// the opening boundary for emphasis/code (but not links/images).
 fn construct_revealed(reveal: Selection, outer: &Range<usize>, marker: &Range<usize>) -> bool {
     if marker.start < reveal.head && reveal.head < marker.end {
         return true;
@@ -203,7 +203,14 @@ pub fn project(block: &Block, source: &str, reveal: Selection) -> Projection {
     }
 
     for marker in &block.markers {
-        let touched = construct_revealed(reveal, &marker.outer, &marker.range);
+        // Links and images stay quiet when the caret merely sits before them;
+        // emphasis/code markers reveal at that boundary too, so the caret the
+        // user sees before the word immediately shows what it is next to.
+        let at_construct_start = reveal.is_caret()
+            && reveal.head == marker.outer.start
+            && !matches!(marker.kind, MarkerKind::Link | MarkerKind::Image);
+        let touched =
+            at_construct_start || construct_revealed(reveal, &marker.outer, &marker.range);
         if !touched {
             continue;
         }
@@ -330,6 +337,14 @@ mod tests {
         let doc = parse(md);
         let p = project(&doc.blocks[0], md, Selection::caret(5));
         assert_eq!(p.text, "A **bold** word");
+    }
+
+    #[test]
+    fn italic_marker_reveals_at_its_opening_boundary() {
+        let md = "A *italic* word";
+        let doc = parse(md);
+        let p = project(&doc.blocks[0], md, Selection::caret(2));
+        assert_eq!(p.text, "A *italic* word");
     }
 
     #[test]
