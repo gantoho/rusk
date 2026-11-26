@@ -333,6 +333,15 @@ mod tests {
     }
 
     #[test]
+    fn italic_marker_reveals_inside_a_list_item() {
+        let md = "- **Bold**, *italic*, ~~strikethrough~~, and `inline code` render in place.";
+        let doc = parse(md);
+        let head = md.find("italic").expect("italic") + 2;
+        let p = project(&doc.blocks[0], md, Selection::caret(head));
+        assert!(p.text.contains("*italic*"), "projection was {}", p.text);
+    }
+
+    #[test]
     fn links_hide_destination() {
         let md = "[Rusk](https://example.com) is here";
         let doc = parse(md);

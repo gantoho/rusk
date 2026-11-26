@@ -328,6 +328,8 @@ impl Builder {
     }
 
     fn expand_to(&mut self, range: &Range<usize>) {
+        self.range.start = self.range.start.min(range.start);
+        self.range.end = self.range.end.max(range.end);
         self.content_start = self.content_start.min(range.start);
         self.content_end = self.content_end.max(range.end);
     }
@@ -761,9 +763,19 @@ fn begin_paragraph(
     let content_start = range.start;
     let content_end = range.start + trimmed;
     let list_depth = lists.len();
+    // A tight list item starts the paragraph at its first inline event, not at
+    // the item marker. Include the marker in the block range without moving
+    // the editable content start.
+    let block_range = if items.last().is_some_and(|item| !item.marker_emitted) {
+        items.last().map_or(range.clone(), |item| {
+            item.marker.source.start.min(item.line_range.start)..range.end
+        })
+    } else {
+        range
+    };
     *current = Some(Builder::new(
         BlockKind::Paragraph,
-        range,
+        block_range,
         content_start,
         content_end,
         quote_depth,
@@ -1155,6 +1167,20 @@ mod tests {
             doc.blocks[2].list_marker.as_ref().unwrap().kind,
             ListKind::Ordered("1.".to_owned())
         );
+    }
+
+    #[test]
+    fn tight_list_range_covers_all_inline_content() {
+        let md = "- **Bold**, *italic*, ~~strikethrough~~, and `inline code` render in place.";
+        let doc = parse(md);
+        let block = &doc.blocks[0];
+        let italic = md.find("italic").expect("italic");
+        assert!(
+            block.range.start <= italic && italic < block.range.end,
+            "block range {:?} must contain italic at {italic}",
+            block.range
+        );
+        assert_eq!(block.range.end, md.len());
     }
 
     #[test]

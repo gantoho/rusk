@@ -2343,6 +2343,41 @@ mod tests {
     }
 
     #[test]
+    fn italic_markers_reveal_after_a_selection_change() {
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut engine = LayoutEngine::default();
+        let text = "- **Bold**, *italic*, ~~strikethrough~~, and `inline code` render in place.";
+        let mut doc = doc_with_selection(text, 2);
+
+        let mut first = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            first = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None));
+        });
+        output.textures_delta.clear();
+        let mut first = first.expect("first layout");
+
+        let head = text.find("italic").expect("italic") + 2;
+        doc.set_selection(Selection::caret(head));
+        let mut second = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            second = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, Some(&mut first)));
+        });
+        output.textures_delta.clear();
+        let second = second.expect("second layout");
+        let block = second
+            .blocks
+            .iter()
+            .find(|block| block.source_range.start <= head && head <= block.source_range.end)
+            .expect("italic block");
+        assert!(
+            block.projection.text.contains("*italic*"),
+            "projection was {}",
+            block.projection.text
+        );
+    }
+
+    #[test]
     fn table_cells_shift_when_a_reused_layout_moves() {
         let ctx = Context::default();
         let theme = Theme::new(ThemeKind::Paper);
