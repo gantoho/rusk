@@ -425,12 +425,19 @@ fn clamp_to_visible_inline_markers(doc: &mut Document, target: usize, left: bool
             continue;
         }
         for marker in &block.markers {
+            if left && target == marker.range.end && marker.range.end == marker.outer.end {
+                return marker.range.start;
+            }
             if marker.range.start <= target
                 && target < marker.range.end
                 && marker.range.start < marker.range.end
             {
                 return if left {
                     marker.range.start
+                } else if target == marker.range.start && marker.range.end == marker.outer.end {
+                    // Stop on the inside edge of a closing delimiter first.
+                    // The next Right exits after `*`.
+                    target
                 } else {
                     marker.range.end
                 };
@@ -2418,6 +2425,30 @@ mod tests {
         );
         let head = hit_test_local(&mut doc, &layout, target);
         assert_eq!(head, 9, "the visual tail snaps to the text, not after `*`");
+    }
+
+    #[test]
+    fn tail_exit_takes_two_right_steps() {
+        let mut doc = Document::from_text("A *italic* word");
+        doc.set_selection(Selection::caret(8));
+        move_horizontal(&mut doc, false, false, false);
+        assert_eq!(doc.selection().head, 9, "first right stays at c|*");
+        move_horizontal(&mut doc, false, false, false);
+        assert_eq!(doc.selection().head, 10, "second right exits to c*|");
+    }
+
+    #[test]
+    fn left_from_after_bold_enters_before_the_closing_markers() {
+        let md = "Rusk is a native Markdown editor built around one rule: **the Markdown source is the document**.";
+        let mut doc = Document::from_text(md);
+        doc.set_selection(Selection::caret(md.len()));
+        move_horizontal(&mut doc, true, false, false);
+        let closing = md.rfind("**").expect("closing bold");
+        assert_eq!(
+            doc.selection().head,
+            closing,
+            "left from after `.` stops between t and `**`, not after `**`"
+        );
     }
 
     #[test]
