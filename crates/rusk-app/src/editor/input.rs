@@ -1590,7 +1590,7 @@ a
         doc.set_selection(Selection::caret(4));
         let mut engine = LayoutEngine::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0);
+            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
             move_vertical(ui, &layout, &mut doc, 1.0, false);
         });
         output.textures_delta.clear();
@@ -1615,7 +1615,7 @@ a
         doc.set_selection(Selection::caret(3));
         let mut engine = LayoutEngine::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0);
+            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
             move_vertical(ui, &layout, &mut doc, -1.0, false);
         });
         output.textures_delta.clear();
@@ -1639,10 +1639,10 @@ a
         doc.set_selection(Selection::caret(2));
         let mut engine = LayoutEngine::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let mut layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0);
+            let mut layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
             move_vertical(ui, &layout, &mut doc, 1.0, false);
             assert_eq!(doc.selection().head, 7, "down lands in the table");
-            layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0);
+            layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
             move_vertical(ui, &layout, &mut doc, -1.0, false);
             assert_eq!(doc.selection().head, 3, "up lands at the heading end");
         });
@@ -1666,7 +1666,7 @@ a
         doc.set_selection(Selection::caret(20));
         let mut engine = LayoutEngine::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0);
+            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
             move_vertical(ui, &layout, &mut doc, 1.0, false);
         });
         output.textures_delta.clear();
@@ -1690,7 +1690,7 @@ b
         doc.set_selection(Selection::caret(3));
         let mut engine = LayoutEngine::default();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0);
+            let layout = engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None);
             move_vertical(ui, &layout, &mut doc, 1.0, false);
         });
         output.textures_delta.clear();
@@ -1891,7 +1891,7 @@ b
         let build = |engine: &mut crate::editor::layout::LayoutEngine, doc: &mut Document| {
             let mut built = None;
             let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
-                built = Some(engine.build(&ctx, doc, &theme, 900.0, 600.0));
+                built = Some(engine.build(&ctx, doc, &theme, 900.0, 600.0, None));
             });
             output.textures_delta.clear();
             built.expect("layout built")
@@ -2078,7 +2078,7 @@ b
         let mut engine = crate::editor::layout::LayoutEngine::default();
         let mut built = None;
         let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
-            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None));
         });
         output.textures_delta.clear();
         let layout = built.expect("layout built");

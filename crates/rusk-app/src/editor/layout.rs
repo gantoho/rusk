@@ -2,6 +2,7 @@
 //! rectangles. It is deliberately retained: input handling and painting both
 //! read the same layout, so clicking and what you see can never disagree.
 
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,8 +43,18 @@ pub struct DocumentLayout {
     pub height: f32,
     pub content_left: f32,
     pub blocks: Vec<LaidBlock>,
+    pub meta: Vec<BlockMeta>,
     pub mode: ViewMode,
     pub empty: bool,
+}
+
+/// Cheap per-block identity used to reuse a previously laid-out block after
+/// the text before it changed. `reveal` blocks are rebuilt because their
+/// projection depends on the current selection.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlockMeta {
+    pub content_hash: u64,
+    pub reveal: bool,
 }
 
 impl DocumentLayout {
@@ -145,6 +156,89 @@ pub struct ImageBlock {
     pub caption_pos: Pos2,
 }
 
+impl LaidBlock {
+    fn placeholder() -> Self {
+        Self {
+            block: None,
+            source_line: None,
+            kind: LaidKind::Blank,
+            rect: Rect::from_min_size(Pos2::ZERO, Vec2::ZERO),
+            text_pos: Pos2::ZERO,
+            text_width: 0.0,
+            line_height: 0.0,
+            galley: None,
+            projection: Projection::default(),
+            source_range: 0..0,
+            quote_depth: 0,
+            list_marker: None,
+        }
+    }
+
+    /// Shift every source offset after an edit before this block. Content is
+    /// unchanged, only its byte position moved.
+    fn shift_source(&mut self, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let shift = |value: usize| -> usize {
+            if delta >= 0 {
+                value.saturating_add(delta as usize)
+            } else {
+                value.saturating_sub(delta.unsigned_abs())
+            }
+        };
+        let shift_range = |range: &mut Range<usize>| {
+            range.start = shift(range.start);
+            range.end = shift(range.end);
+        };
+        shift_range(&mut self.source_range);
+        self.projection.empty_source = shift(self.projection.empty_source);
+        for segment in &mut self.projection.segments {
+            shift_range(&mut segment.source);
+        }
+        if let LaidKind::TableGrid { grid } = &mut self.kind {
+            for cell in &mut grid.cells {
+                shift_range(&mut cell.source);
+            }
+        }
+    }
+
+    /// Move all visual positions by `dy` points. Fonts and line breaks stay the
+    /// same, so reusing a galley is safe.
+    fn translate_y(&mut self, dy: f32) {
+        if dy == 0.0 {
+            return;
+        }
+        let offset = Vec2::new(0.0, dy);
+        self.rect = self.rect.translate(offset);
+        self.text_pos.y += dy;
+        match &mut self.kind {
+            LaidKind::Code { bg, .. } | LaidKind::TableSource { bg } => {
+                *bg = bg.translate(offset);
+            }
+            LaidKind::TableGrid { grid } => {
+                grid.bg = grid.bg.translate(offset);
+                for cell in &mut grid.cells {
+                    cell.rect = cell.rect.translate(offset);
+                }
+            }
+            LaidKind::ImageBlock { image } => {
+                image.bg = image.bg.translate(offset);
+                if let Some(rect) = &mut image.image_rect {
+                    *rect = rect.translate(offset);
+                }
+                image.caption_pos.y += dy;
+            }
+            LaidKind::Text { .. }
+            | LaidKind::CodeSource
+            | LaidKind::Rule
+            | LaidKind::SourceLine { .. }
+            | LaidKind::Blank
+            | LaidKind::Spacer => {}
+        }
+    }
+}
+
 pub struct LayoutEngine {
     pub code: CodeHighlighter,
     pub images: ImageCache,
@@ -167,6 +261,7 @@ impl LayoutEngine {
         theme: &Theme,
         width: f32,
         min_height: f32,
+        mut previous: Option<&mut DocumentLayout>,
     ) -> DocumentLayout {
         let text = doc.text();
         let path = doc.path().map(PathBuf::from);
@@ -190,6 +285,7 @@ impl LayoutEngine {
         };
 
         let mut blocks = Vec::new();
+        let mut meta = Vec::new();
         let mut y = TOP_PAD;
 
         match mode {
@@ -204,9 +300,16 @@ impl LayoutEngine {
                     &mut y,
                     &mut blocks,
                 );
+                meta.resize(blocks.len(), BlockMeta::default());
             }
             ViewMode::Wysiwyg => {
                 let blanks = blank_lines(&text);
+                let reusable = previous.as_ref().is_some_and(|old| {
+                    old.key.width_px == key.width_px
+                        && old.key.mode == mode
+                        && old.key.dark == key.dark
+                        && old.meta.len() == old.blocks.len()
+                });
                 let mut next_blank = 0;
                 let mut source_cursor = 0;
                 let mut last_bottom = 0.0;
@@ -223,18 +326,73 @@ impl LayoutEngine {
                             let spacer = (index > 0)
                                 .then(|| separator_gap(&text, &blank, last_bottom, top, selection))
                                 .flatten();
-                            push_blank_line(
-                                &mut blocks,
-                                content_left,
-                                content_width,
-                                &mut y,
-                                blank,
-                                spacer,
-                            );
+                            let reveal = selection_touches_line(selection, &text, blank.start);
+                            let content_hash = blank_hash(&blank, spacer, reveal);
+                            let reused = !reveal
+                                && reusable
+                                && previous.as_ref().is_some_and(|old| {
+                                    old.meta.get(blocks.len()).is_some_and(|meta| {
+                                        !meta.reveal && meta.content_hash == content_hash
+                                    })
+                                })
+                                && previous.as_deref_mut().is_some_and(|old| {
+                                    reuse_blank(
+                                        old,
+                                        blocks.len(),
+                                        &mut blocks,
+                                        &mut meta,
+                                        &mut y,
+                                        blank,
+                                        spacer,
+                                        content_hash,
+                                        reveal,
+                                    )
+                                });
+                            if !reused {
+                                push_blank_line(
+                                    &mut blocks,
+                                    content_left,
+                                    content_width,
+                                    &mut y,
+                                    blank,
+                                    spacer,
+                                );
+                                meta.push(BlockMeta {
+                                    content_hash,
+                                    reveal,
+                                });
+                            }
                             source_cursor = blank.start;
                         }
                     }
                     y += top;
+
+                    let reveal = selection_touches_block(block, selection);
+                    let content_hash = block_hash(block, &text);
+                    if reusable
+                        && let Some(old) = previous.as_deref_mut()
+                        && let Some(old_meta) = old.meta.get(blocks.len()).copied()
+                        && !old_meta.reveal
+                        && !reveal
+                        && old_meta.content_hash == content_hash
+                        && let Some(slot) = old.blocks.get_mut(blocks.len())
+                    {
+                        let mut laid = std::mem::replace(slot, LaidBlock::placeholder());
+                        let source_delta =
+                            block.content.start as isize - laid.source_range.start as isize;
+                        laid.shift_source(source_delta);
+                        laid.translate_y(y - laid.rect.top());
+                        y += laid.rect.height() + bottom;
+                        last_bottom = bottom;
+                        blocks.push(laid);
+                        meta.push(BlockMeta {
+                            content_hash,
+                            reveal,
+                        });
+                        source_cursor = source_cursor.max(block.range.end);
+                        continue;
+                    }
+
                     let laid = build_block(
                         ctx,
                         theme,
@@ -253,6 +411,10 @@ impl LayoutEngine {
                     y += laid.rect.height() + bottom;
                     last_bottom = bottom;
                     blocks.push(laid);
+                    meta.push(BlockMeta {
+                        content_hash,
+                        reveal,
+                    });
                     source_cursor = source_cursor.max(block.range.end);
                 }
                 // Trailing blank lines separate nothing, so they keep their rows.
@@ -260,14 +422,42 @@ impl LayoutEngine {
                     let blank = blanks[next_blank];
                     next_blank += 1;
                     if blank.start >= source_cursor {
-                        push_blank_line(
-                            &mut blocks,
-                            content_left,
-                            content_width,
-                            &mut y,
-                            blank,
-                            None,
-                        );
+                        let reveal = selection_touches_line(selection, &text, blank.start);
+                        let content_hash = blank_hash(&blank, None, reveal);
+                        let reused = !reveal
+                            && reusable
+                            && previous.as_ref().is_some_and(|old| {
+                                old.meta.get(blocks.len()).is_some_and(|meta| {
+                                    !meta.reveal && meta.content_hash == content_hash
+                                })
+                            })
+                            && previous.as_deref_mut().is_some_and(|old| {
+                                reuse_blank(
+                                    old,
+                                    blocks.len(),
+                                    &mut blocks,
+                                    &mut meta,
+                                    &mut y,
+                                    blank,
+                                    None,
+                                    content_hash,
+                                    reveal,
+                                )
+                            });
+                        if !reused {
+                            push_blank_line(
+                                &mut blocks,
+                                content_left,
+                                content_width,
+                                &mut y,
+                                blank,
+                                None,
+                            );
+                            meta.push(BlockMeta {
+                                content_hash,
+                                reveal,
+                            });
+                        }
                         source_cursor = blank.start;
                     }
                 }
@@ -281,6 +471,7 @@ impl LayoutEngine {
             height,
             content_left,
             blocks,
+            meta,
             mode,
             empty: text.is_empty(),
         }
@@ -298,6 +489,8 @@ struct BlankLine {
     /// Byte offset where typing on this line belongs, after quote markers.
     content: usize,
     quote_depth: usize,
+    /// Whether the physical line immediately before this one was fully blank.
+    previous_blank: bool,
 }
 
 /// Lines whose content is empty (including the line after a trailing
@@ -305,6 +498,7 @@ struct BlankLine {
 fn blank_lines(text: &str) -> Vec<BlankLine> {
     let mut blanks = Vec::new();
     let mut start = 0;
+    let mut previous_blank = false;
     for line in text.split_inclusive('\n') {
         let content = line.trim_end_matches(['\n', '\r']);
         if content.trim().is_empty() {
@@ -312,13 +506,19 @@ fn blank_lines(text: &str) -> Vec<BlankLine> {
                 start,
                 content: start,
                 quote_depth: 0,
+                previous_blank,
             });
+            previous_blank = true;
         } else if let Some(depth) = quote_only_prefix(content) {
             blanks.push(BlankLine {
                 start,
                 content: start + content.len(),
                 quote_depth: depth,
+                previous_blank,
             });
+            previous_blank = false;
+        } else {
+            previous_blank = false;
         }
         start += line.len();
     }
@@ -327,6 +527,7 @@ fn blank_lines(text: &str) -> Vec<BlankLine> {
             start: text.len(),
             content: text.len(),
             quote_depth: 0,
+            previous_blank,
         });
     }
     blanks
@@ -372,9 +573,7 @@ fn separator_gap(
     selection: Selection,
 ) -> Option<f32> {
     let truly_blank = blank.quote_depth == 0 && blank.content == blank.start;
-    if !truly_blank
-        || previous_line_is_blank(text, blank.start)
-        || selection_touches_line(selection, text, blank.start)
+    if !truly_blank || blank.previous_blank || selection_touches_line(selection, text, blank.start)
     {
         return None;
     }
@@ -429,6 +628,56 @@ pub(super) fn previous_line_is_blank(text: &str, at: usize) -> bool {
     text[start..end].trim().is_empty()
 }
 
+fn blank_hash(blank: &BlankLine, spacer: Option<f32>, reveal: bool) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    blank.quote_depth.hash(&mut hasher);
+    (blank.content == blank.start).hash(&mut hasher);
+    spacer.map(f32::to_bits).hash(&mut hasher);
+    reveal.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reuse_blank(
+    old: &mut DocumentLayout,
+    index: usize,
+    blocks: &mut Vec<LaidBlock>,
+    meta: &mut Vec<BlockMeta>,
+    y: &mut f32,
+    blank: BlankLine,
+    spacer: Option<f32>,
+    content_hash: u64,
+    reveal: bool,
+) -> bool {
+    let Some(old_meta) = old.meta.get(index).copied() else {
+        return false;
+    };
+    if old_meta.reveal || old_meta.content_hash != content_hash {
+        return false;
+    }
+    let Some(slot) = old.blocks.get_mut(index) else {
+        return false;
+    };
+    let kind_matches = matches!(
+        (&slot.kind, spacer),
+        (LaidKind::Blank, None) | (LaidKind::Spacer, Some(_))
+    );
+    if !kind_matches {
+        return false;
+    }
+    let mut laid = std::mem::replace(slot, LaidBlock::placeholder());
+    let source_delta = blank.content as isize - laid.source_range.start as isize;
+    laid.shift_source(source_delta);
+    laid.translate_y(*y - laid.rect.top());
+    *y += laid.rect.height();
+    blocks.push(laid);
+    meta.push(BlockMeta {
+        content_hash,
+        reveal,
+    });
+    true
+}
+
 fn push_blank_line(
     blocks: &mut Vec<LaidBlock>,
     content_left: f32,
@@ -463,6 +712,20 @@ fn push_blank_line(
         list_marker: None,
     });
     *y += row_height;
+}
+
+fn selection_touches_block(block: &Block, selection: Selection) -> bool {
+    selection.start() <= block.range.end && selection.end() >= block.range.start
+}
+
+fn block_hash(block: &Block, source: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    source[block.range.clone()].hash(&mut hasher);
+    std::mem::discriminant(&block.kind).hash(&mut hasher);
+    block.quote_depth.hash(&mut hasher);
+    block.list_depth.hash(&mut hasher);
+    block.list_marker.is_some().hash(&mut hasher);
+    hasher.finish()
 }
 
 fn spacing_for(block: &Block, previous: Option<&LaidBlock>, live_source: bool) -> (f32, f32) {
@@ -1521,6 +1784,7 @@ mod tests {
     use super::*;
     use crate::editor::paint;
     use crate::theme::{Theme, ThemeKind};
+    use rusk_core::EditKind;
 
     #[test]
     fn blank_lines_follow_source_lines() {
@@ -1561,7 +1825,7 @@ mod tests {
         let mut engine = LayoutEngine::default();
         let mut built = None;
         let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
-            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None));
         });
         output.textures_delta.clear();
         let layout = built.expect("layout built");
@@ -1595,7 +1859,7 @@ mod tests {
         let mut engine = LayoutEngine::default();
         let mut built = None;
         let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
-            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None));
         });
         output.textures_delta.clear();
         let layout = built.expect("layout built");
@@ -1617,7 +1881,7 @@ mod tests {
         let mut engine = LayoutEngine::default();
         let mut built = None;
         let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
-            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None));
         });
         output.textures_delta.clear();
         let layout = built.expect("layout built");
@@ -1661,7 +1925,7 @@ mod tests {
         let mut engine = LayoutEngine::default();
         let mut built = None;
         let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
-            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None));
         });
         output.textures_delta.clear();
         let layout = built.expect("layout built");
@@ -1705,7 +1969,7 @@ mod tests {
         let mut engine = LayoutEngine::default();
         let mut built = None;
         let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
-            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None));
         });
         output.textures_delta.clear();
         let layout = built.expect("layout built");
@@ -1745,7 +2009,7 @@ mod tests {
         let mut engine = LayoutEngine::default();
         let mut built = None;
         let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
-            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None));
         });
         output.textures_delta.clear();
         let layout = built.expect("layout built");
@@ -1779,7 +2043,7 @@ mod tests {
         let build = |engine: &mut LayoutEngine, doc: &mut Document| {
             let mut built = None;
             let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
-                built = Some(engine.build(&ctx, doc, &theme, 900.0, 600.0));
+                built = Some(engine.build(&ctx, doc, &theme, 900.0, 600.0, None));
             });
             output.textures_delta.clear();
             built.expect("layout built")
@@ -1826,7 +2090,7 @@ mod tests {
         let build = |engine: &mut LayoutEngine, doc: &mut Document| {
             let mut built = None;
             let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
-                built = Some(engine.build(&ctx, doc, &theme, 900.0, 600.0));
+                built = Some(engine.build(&ctx, doc, &theme, 900.0, 600.0, None));
             });
             output.textures_delta.clear();
             built.expect("layout built")
@@ -1875,7 +2139,7 @@ mod tests {
         let mut engine = LayoutEngine::default();
         let mut built = None;
         let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
-            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0));
+            built = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None));
         });
         output.textures_delta.clear();
         let layout = built.expect("layout built");
@@ -1924,7 +2188,7 @@ mod tests {
         let build = |engine: &mut LayoutEngine, doc: &mut Document| {
             let mut built = None;
             let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
-                built = Some(engine.build(&ctx, doc, &theme, 900.0, 600.0));
+                built = Some(engine.build(&ctx, doc, &theme, 900.0, 600.0, None));
             });
             output.textures_delta.clear();
             built.expect("layout built")
@@ -1980,7 +2244,7 @@ mod tests {
         let build = |engine: &mut LayoutEngine, doc: &mut Document| {
             let mut built = None;
             let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
-                built = Some(engine.build(&ctx, doc, &theme, 900.0, 600.0));
+                built = Some(engine.build(&ctx, doc, &theme, 900.0, 600.0, None));
             });
             output.textures_delta.clear();
             built.expect("layout built")
@@ -2028,5 +2292,94 @@ mod tests {
                 .iter()
                 .any(|b| matches!(b.kind, LaidKind::TableSource { .. }))
         );
+    }
+
+    #[test]
+    fn layout_reuses_shifted_blocks_after_an_insertion() {
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut engine = LayoutEngine::default();
+        let mut doc = doc_with_selection("alpha\n\n# title\n\nomega\n", 0);
+
+        let mut first = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            first = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None));
+        });
+        output.textures_delta.clear();
+        let mut first = first.expect("first layout");
+        let old_title = first
+            .blocks
+            .iter()
+            .find(|block| matches!(block.kind, LaidKind::Text { heading: Some(1) }))
+            .expect("heading");
+        let old_title_start = old_title.source_range.start;
+        let old_title_y = old_title.text_pos.y;
+        let blank_index = first
+            .blocks
+            .iter()
+            .position(|block| matches!(block.kind, LaidKind::Blank | LaidKind::Spacer))
+            .expect("blank row");
+        let old_blank_start = first.blocks[blank_index].source_range.start;
+
+        doc.insert_text("x", EditKind::Insert);
+        let mut second = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            second = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, Some(&mut first)));
+        });
+        output.textures_delta.clear();
+        let second = second.expect("second layout");
+        let title = second
+            .blocks
+            .iter()
+            .find(|block| matches!(block.kind, LaidKind::Text { heading: Some(1) }))
+            .expect("heading after insertion");
+        assert_eq!(title.source_range.start, old_title_start + 1);
+        assert_eq!(title.text_pos.y, old_title_y);
+        assert_eq!(
+            second.blocks[blank_index].source_range.start,
+            old_blank_start + 1
+        );
+        assert_eq!(second.blocks.len(), first.blocks.len());
+    }
+
+    #[test]
+    fn table_cells_shift_when_a_reused_layout_moves() {
+        let ctx = Context::default();
+        let theme = Theme::new(ThemeKind::Paper);
+        let mut engine = LayoutEngine::default();
+        let text = "intro\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nbelow\n";
+        let mut doc = doc_with_selection(text, 0);
+
+        let mut first = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            first = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, None));
+        });
+        output.textures_delta.clear();
+        let mut first = first.expect("first layout");
+        let old_cell = first
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                LaidKind::TableGrid { grid } => grid.cells.first().map(|cell| cell.source.start),
+                _ => None,
+            })
+            .expect("table cell");
+
+        doc.insert_text("x", EditKind::Insert);
+        let mut second = None;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {
+            second = Some(engine.build(&ctx, &mut doc, &theme, 900.0, 600.0, Some(&mut first)));
+        });
+        output.textures_delta.clear();
+        let second = second.expect("second layout");
+        let new_cell = second
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                LaidKind::TableGrid { grid } => grid.cells.first().map(|cell| cell.source.start),
+                _ => None,
+            })
+            .expect("table cell after insertion");
+        assert_eq!(new_cell, old_cell + 1);
     }
 }

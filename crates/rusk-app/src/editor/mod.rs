@@ -98,7 +98,11 @@ impl Editor {
 
         let key = self.key(doc, width, theme);
         if self.layout.as_ref().is_none_or(|layout| layout.key != key) {
-            let layout = self.engine.build(&ctx, doc, theme, width, min_height);
+            let layout = {
+                let mut previous = self.layout.take();
+                self.engine
+                    .build(&ctx, doc, theme, width, min_height, previous.as_mut())
+            };
             self.layout = Some(layout);
         }
 
@@ -159,7 +163,11 @@ impl Editor {
                     .as_ref()
                     .is_none_or(|layout| layout.key != new_key)
                 {
-                    let layout = self.engine.build(&ctx, doc, theme, width, min_height);
+                    let layout = {
+                        let mut previous = self.layout.take();
+                        self.engine
+                            .build(&ctx, doc, theme, width, min_height, previous.as_mut())
+                    };
                     self.layout = Some(layout);
                 }
                 let layout = self.layout.as_ref().expect("layout exists");
@@ -206,7 +214,13 @@ impl Editor {
                     && let Some(caret) = paint::caret_rect_local(layout, doc)
                 {
                     let screen = caret.translate(origin.to_vec2());
-                    ui.scroll_to_rect(screen.expand(28.0), None);
+                    // Only ask the ScrollArea to move when the caret actually
+                    // left the comfortable reading area. Calling
+                    // `scroll_to_rect` for every keystroke makes the page
+                    // twitch by a few pixels when typing near an edge.
+                    if !ui.clip_rect().shrink(18.0).contains_rect(screen) {
+                        ui.scroll_to_rect(screen.expand(36.0), None);
+                    }
                     self.scroll_to_caret = false;
                 }
             });
