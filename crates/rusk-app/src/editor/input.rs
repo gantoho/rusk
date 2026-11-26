@@ -994,9 +994,39 @@ fn delete_word(doc: &mut Document, left: bool) -> bool {
     if target == head {
         return false;
     }
-    let range = if left { target..head } else { head..target };
+    let mut start = target.min(head);
+    let mut end = target.max(head);
+    if doc.mode() == rusk_core::ViewMode::Wysiwyg {
+        let mut clipped = false;
+        for block in &doc.parsed().blocks {
+            for marker in &block.markers {
+                if left
+                    && marker.range.end <= head
+                    && marker.range.start >= start
+                    && marker.range.end <= end
+                {
+                    start = marker.range.end;
+                    clipped = true;
+                } else if !left
+                    && marker.range.start >= head
+                    && marker.range.end <= end
+                    && marker.range.start >= start
+                {
+                    end = marker.range.start;
+                    clipped = true;
+                }
+            }
+        }
+        if clipped {
+            if start >= end {
+                return false;
+            }
+            doc.set_selection(Selection::new(start, end));
+            return delete_selection_guarded(doc);
+        }
+    }
     doc.apply_transaction(Transaction::new(
-        vec![Edit::delete(range)],
+        vec![Edit::delete(start..end)],
         Selection::caret(target.min(head)),
         EditKind::Delete,
     ))
@@ -2244,6 +2274,14 @@ mod tests {
         doc.set_selection(Selection::new(1, 5));
         assert!(backspace_guarded(&mut doc));
         assert_eq!(doc.text(), "");
+    }
+
+    #[test]
+    fn ctrl_backspace_at_the_end_of_bold_removes_the_word_and_markers() {
+        let mut doc = Document::from_text("A **bold** word");
+        doc.set_selection(Selection::caret(8));
+        assert!(delete_word(&mut doc, true));
+        assert_eq!(doc.text(), "A  word");
     }
 
     #[test]
